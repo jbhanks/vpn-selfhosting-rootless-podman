@@ -1,0 +1,391 @@
+---
+- name: Bitwarden | Set derived vars / defaults
+  ansible.builtin.set_fact:
+      BITWARDEN_USER: "{{ BITWARDEN_USER | default('bitwarden') }}"
+      BITWARDEN_FQDN: "{{ BITWARDEN_FQDN | default('bitwarden.' ~ DOMAIN) }}"
+
+      # Rootless quadlet location (per-user)
+      BITWARDEN_QUADLET_DIR: >-
+          {{ BITWARDEN_QUADLET_DIR | default('/home/' ~ (BITWARDEN_USER | default('bitwarden')) ~ '/.config/containers/systemd') }}
+
+      # Host paths
+      BITWARDEN_ENV_DIR: "{{ BITWARDEN_ENV_DIR | default('/etc/bitwarden') }}"
+      BITWARDEN_ENV_FILE: "{{ BITWARDEN_ENV_FILE | default('/etc/bitwarden/bitwarden.env') }}"
+      BITWARDEN_DATA_DIR: "{{ BITWARDEN_DATA_DIR | default('/var/lib/bitwarden') }}"
+
+      # Networking (HTTP app + websocket hub on same container, different internal port)
+      BITWARDEN_LISTEN_HOST: "{{ BITWARDEN_LISTEN_HOST | default('127.0.0.1') }}"
+      BITWARDEN_LISTEN_PORT: "{{ BITWARDEN_LISTEN_PORT | default('8222') }}"
+      BITWARDEN_WS_LISTEN_PORT: "{{ BITWARDEN_WS_LISTEN_PORT | default('8223') }}"
+
+      # Container
+      BITWARDEN_IMAGE: "{{ BITWARDEN_IMAGE | default('docker.io/vaultwarden/server:latest') }}"
+      BITWARDEN_SERVICE_NAME: "{{ BITWARDEN_SERVICE_NAME | default('bitwarden') }}"
+
+      # Postgres (host)
+      BITWARDEN_DB_NAME: "{{ BITWARDEN_DB_NAME | default('bitwarden') }}"
+      BITWARDEN_DB_USER: "{{ BITWARDEN_DB_USER | default('bitwarden') }}"
+      # IMPORTANT: inside a rootless container, 127.0.0.1 is the *container*, not the host.
+      # Podman provides host.containers.internal as the host-reachable address from the container.
+      BITWARDEN_DB_HOST: "{{ BITWARDEN_DB_HOST | default('host.containers.internal') }}"
+      BITWARDEN_DB_PORT: "{{ BITWARDEN_DB_PORT | default('5432') }}"
+
+- name: Bitwarden | Assert required vars
+  ansible.builtin.assert:
+      that:
+          - DOMAIN is defined
+          - BITWARDEN_DB_PASSWORD is defined
+          - DBSUPERPASS is defined
+      fail_msg: "You must define DOMAIN, BITWARDEN_DB_PASSWORD, and DBSUPERPASS."
+
+- name: Bitwarden | Ensure bitwarden user exists
+  ansible.builtin.user:
+      name: "{{ BITWARDEN_USER }}"
+      create_home: true
+      shell: /bin/bash
+      system: true
+
+# - name: Bitwarden | Enable linger for rootless user services
+#   ansible.builtin.command: "loginctl enable-linger {{ BITWARDEN_USER }}"
+#   changed_when: false
+
+- name: Bitwarden | Ensure env dir exists (readable by {{ BITWARDEN_USER }})
+  ansible.builtin.file:
+      path: "{{ BITWARDEN_ENV_DIR }}"
+      state: directory
+      owner: root
+      group: "{{ BITWARDEN_USER }}"
+      mode: "0750"
+
+- name: Bitwarden | Ensure data dir exists (host filesystem storage)
+  ansible.builtin.file:
+      path: "{{ BITWARDEN_DATA_DIR }}"
+      state: directory
+      owner: "{{ BITWARDEN_USER }}"
+      group: "{{ BITWARDEN_USER }}"
+      mode: "0750"
+
+- name: "Bitwarden | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+    - name: "Bitwarden | Get UID of {{ BITWARDEN_USER }}"
+      ansible.builtin.command: "id -u {{ BITWARDEN_USER }}"
+      register: bitwarden_uid
+      changed_when: false
+
+    - name: "Bitwarden | Set XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS"
+      ansible.builtin.set_fact:
+        BITWARDEN_XDG_RUNTIME_DIR: "/run/user/{{ bitwarden_uid.stdout | trim }}"
+        BITWARDEN_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ bitwarden_uid.stdout | trim }}/bus"
+
+- name: "Bitwarden | Ensure subuid/subgid ranges exist for rootless userns"
+  block:
+    - name: "Bitwarden | Ensure /etc/subuid has range for {{ BITWARDEN_USER }}"
+      ansible.builtin.lineinfile:
+        path: /etc/subuid
+        create: true
+        line: "{{ BITWARDEN_USER }}:{{ BITWARDEN_SUBID_START | default('400000') }}:{{ BITWARDEN_SUBID_COUNT | default('65536') }}"
+        regexp: "^{{ BITWARDEN_USER }}:"
+        state: present
+        mode: "0644"
+
+    - name: "Bitwarden | Ensure /etc/subgid has range for {{ BITWARDEN_USER }}"
+      ansible.builtin.lineinfile:
+        path: /etc/subgid
+        create: true
+        line: "{{ BITWARDEN_USER }}:{{ BITWARDEN_SUBID_START | default('400000') }}:{{ BITWARDEN_SUBID_COUNT | default('65536') }}"
+        regexp: "^{{ BITWARDEN_USER }}:"
+        state: present
+        mode: "0644"
+
+    - name: "Bitwarden | podman system migrate (rootless user storage)"
+      become: true
+      become_user: "{{ BITWARDEN_USER }}"
+      ansible.builtin.command: "podman system migrate"
+      environment:
+        XDG_RUNTIME_DIR: "{{ BITWARDEN_XDG_RUNTIME_DIR }}"
+        DBUS_SESSION_BUS_ADDRESS: "{{ BITWARDEN_DBUS_SESSION_BUS_ADDRESS }}"
+      changed_when: false
+  become: true
+
+- name: "Bitwarden | Postgres: allow access + create role/db (host Postgres)"
+  block:
+      - name: "Bitwarden | Postgres: discover pg_hba.conf path"
+        become: true
+        become_user: postgres
+        ansible.builtin.command: >
+            psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+        environment:
+            PGPASSWORD: "{{ DBSUPERPASS }}"
+        register: bitwarden_hba_file
+        changed_when: false
+
+      # Optional: allow a known podman subnet (only if you track it)
+      - name: "Bitwarden | Postgres: allow podman subnet (bitwarden -> bitwarden)"
+        community.postgresql.postgresql_pg_hba:
+            dest: "{{ bitwarden_hba_file.stdout | trim }}"
+            contype: host
+            databases: "{{ BITWARDEN_DB_NAME }}"
+            users: "{{ BITWARDEN_DB_USER }}"
+            source: "{{ BITWARDEN_PODMAN_SUBNET }}"
+            method: scram-sha-256
+            state: present
+        when: BITWARDEN_PODMAN_SUBNET is defined
+
+      - name: "Bitwarden | Postgres: allow podman subnet (postgres -> bitwarden db admin)"
+        community.postgresql.postgresql_pg_hba:
+            dest: "{{ bitwarden_hba_file.stdout | trim }}"
+            contype: host
+            databases: "{{ BITWARDEN_DB_NAME }}"
+            users: postgres
+            source: "{{ BITWARDEN_PODMAN_SUBNET }}"
+            method: scram-sha-256
+            state: present
+        when: BITWARDEN_PODMAN_SUBNET is defined
+
+      # Always allow samehost (matches your existing pattern)
+      - name: "Bitwarden | Postgres: allow samehost (bitwarden -> bitwarden)"
+        community.postgresql.postgresql_pg_hba:
+            dest: "{{ bitwarden_hba_file.stdout | trim }}"
+            contype: host
+            databases: "{{ BITWARDEN_DB_NAME }}"
+            users: "{{ BITWARDEN_DB_USER }}"
+            source: samehost
+            method: scram-sha-256
+            state: present
+
+      - name: "Bitwarden | Postgres: allow samehost (postgres -> bitwarden db admin)"
+        community.postgresql.postgresql_pg_hba:
+            dest: "{{ bitwarden_hba_file.stdout | trim }}"
+            contype: host
+            databases: "{{ BITWARDEN_DB_NAME }}"
+            users: postgres
+            source: samehost
+            method: scram-sha-256
+            state: present
+
+      - name: "Bitwarden | Postgres: reload config"
+        become: true
+        become_user: postgres
+        ansible.builtin.command: >
+            psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+        environment:
+            PGPASSWORD: "{{ DBSUPERPASS }}"
+        changed_when: false
+
+      - name: "Bitwarden | Postgres: ensure role exists"
+        community.postgresql.postgresql_user:
+            login_host: "127.0.0.1"
+            login_port: "{{ DBPORT | int }}"
+            login_user: postgres
+            login_password: "{{ DBSUPERPASS }}"
+            name: "{{ BITWARDEN_DB_USER }}"
+            password: "{{ BITWARDEN_DB_PASSWORD }}"
+            encrypted: true
+            state: present
+
+      - name: "Bitwarden | Postgres: ensure database exists"
+        community.postgresql.postgresql_db:
+            login_host: "127.0.0.1"
+            login_port: "{{ DBPORT | int }}"
+            login_user: postgres
+            login_password: "{{ DBSUPERPASS }}"
+            name: "{{ BITWARDEN_DB_NAME }}"
+            owner: "{{ BITWARDEN_DB_USER }}"
+            state: present
+
+- name: Bitwarden | Write env file (readable by {{ BITWARDEN_USER }})
+  ansible.builtin.copy:
+      dest: "{{ BITWARDEN_ENV_FILE }}"
+      owner: root
+      group: "{{ BITWARDEN_USER }}"
+      mode: "0640"
+      content: |
+          # Vaultwarden (Bitwarden-compatible)
+
+          # External URL
+          DOMAIN=https://{{ BITWARDEN_FQDN }}
+
+          # Use Postgres on the host (vaultwarden uses DATABASE_URL)
+          DATABASE_URL=postgresql://{{ BITWARDEN_DB_USER }}:{{ BITWARDEN_DB_PASSWORD }}@{{ BITWARDEN_DB_HOST }}:{{ BITWARDEN_DB_PORT }}/{{ BITWARDEN_DB_NAME }}
+
+          # Persisted data folder inside container
+          DATA_FOLDER=/data
+
+          # Websocket notifications endpoint (/notifications/hub)
+          WEBSOCKET_ENABLED=true
+
+          # Admin UI (optional; set a strong token if you enable)
+          {% if BITWARDEN_ADMIN_TOKEN is defined %}
+          ADMIN_TOKEN={{ BITWARDEN_ADMIN_TOKEN }}
+          {% endif %}
+
+          # Misc sane defaults (optional; override if you want)
+          SIGNUPS_ALLOWED=false
+
+- name: Bitwarden | Ensure quadlet dir exists (rootless)
+  ansible.builtin.file:
+      path: "{{ BITWARDEN_QUADLET_DIR }}"
+      state: directory
+      owner: "{{ BITWARDEN_USER }}"
+      group: "{{ BITWARDEN_USER }}"
+      mode: "0755"
+
+- name: Bitwarden | Install quadlet container unit (rootless)
+  ansible.builtin.copy:
+      dest: "{{ BITWARDEN_QUADLET_DIR }}/{{ BITWARDEN_SERVICE_NAME }}.container"
+      owner: "{{ BITWARDEN_USER }}"
+      group: "{{ BITWARDEN_USER }}"
+      mode: "0644"
+      content: |
+          [Container]
+          ContainerName=bitwarden
+          Image={{ BITWARDEN_IMAGE }}
+          EnvironmentFile={{ BITWARDEN_ENV_FILE }}
+
+          # Bind only to localhost on the host:
+          # - App/API on container port 80
+          # - Websocket hub on container port 3012
+          PublishPort={{ BITWARDEN_LISTEN_HOST }}:{{ BITWARDEN_LISTEN_PORT }}:80
+          PublishPort={{ BITWARDEN_LISTEN_HOST }}:{{ BITWARDEN_WS_LISTEN_PORT }}:3012
+
+          Volume={{ BITWARDEN_DATA_DIR }}:/data:Z
+
+          [Service]
+          Restart=always
+
+          [Install]
+          WantedBy=default.target
+
+- name: "Bitwarden | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+      - name: "Bitwarden | Get UID of {{ BITWARDEN_USER }}"
+        ansible.builtin.command: "id -u {{ BITWARDEN_USER }}"
+        register: bitwarden_uid
+        changed_when: false
+
+      - name: "Bitwarden | Set runtime facts"
+        ansible.builtin.set_fact:
+            BITWARDEN_UID: "{{ bitwarden_uid.stdout | trim }}"
+            BITWARDEN_XDG_RUNTIME_DIR: "/run/user/{{ bitwarden_uid.stdout | trim }}"
+            BITWARDEN_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ bitwarden_uid.stdout | trim }}/bus"
+
+      - name: "Bitwarden | Ensure XDG runtime dir exists"
+        ansible.builtin.file:
+            path: "{{ BITWARDEN_XDG_RUNTIME_DIR }}"
+            state: directory
+            owner: "{{ BITWARDEN_USER }}"
+            group: "{{ BITWARDEN_USER }}"
+            mode: "0700"
+
+      - name: "Bitwarden | Ensure user manager is started (user@UID)"
+        ansible.builtin.systemd:
+            name: "user@{{ BITWARDEN_UID }}.service"
+            state: started
+  become: true
+
+- name: "Bitwarden | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ BITWARDEN_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+      XDG_RUNTIME_DIR: "{{ BITWARDEN_XDG_RUNTIME_DIR }}"
+      DBUS_SESSION_BUS_ADDRESS: "{{ BITWARDEN_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+- name: "Bitwarden | Start container service (generated; do not enable)"
+  block:
+      - name: "Bitwarden | Start service"
+        ansible.builtin.command:
+            cmd: >-
+                systemctl --machine={{ BITWARDEN_USER }}@.host --user
+                start {{ BITWARDEN_SERVICE_NAME }}.service
+        changed_when: false
+
+  rescue:
+      - name: "Bitwarden | Status (for debugging)"
+        ansible.builtin.command:
+            cmd: >-
+                systemctl --user -M {{ BITWARDEN_USER }}@.host
+                status {{ BITWARDEN_SERVICE_NAME }}.service --no-pager
+        changed_when: false
+        failed_when: false
+        register: bitwarden_status
+
+      - name: "Bitwarden | Journal (for debugging)"
+        ansible.builtin.command:
+            cmd: >-
+                journalctl --user -M {{ BITWARDEN_USER }}@.host
+                -xeu {{ BITWARDEN_SERVICE_NAME }}.service --no-pager
+        changed_when: false
+        failed_when: false
+        register: bitwarden_journal
+
+      - name: "Bitwarden | Show status"
+        ansible.builtin.debug:
+            var: bitwarden_status.stdout_lines
+
+      - name: "Bitwarden | Show journal"
+        ansible.builtin.debug:
+            var: bitwarden_journal.stdout_lines
+
+      - name: "Bitwarden | Fail after diagnostics"
+        ansible.builtin.fail:
+            msg: "Bitwarden (Vaultwarden) service failed to start; see debug output above."
+
+- name: Bitwarden | Write nginx vhost
+  ansible.builtin.copy:
+      dest: "/etc/nginx/conf.d/{{ BITWARDEN_FQDN }}.conf"
+      owner: root
+      group: root
+      mode: "0644"
+      content: |
+        server {
+        listen {{ WG_SERVER_IP }}:80;
+        server_name {{ BITWARDEN_FQDN }};
+        return 301 https://$host$request_uri;
+        }
+          server {
+              listen {{  WG_SERVER_IP }}:443 ssl;
+              http2 on;
+              server_name {{ BITWARDEN_FQDN }};
+
+              include /etc/nginx/default.d/*.conf;
+              ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+              ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+              access_log  /var/log/nginx/{{ BITWARDEN_FQDN }}_access.log  main;
+              error_log   /var/log/nginx/{{ BITWARDEN_FQDN }}_error.log;
+              client_max_body_size 50m;
+
+              # Websocket notifications:
+              # Route /notifications/hub to the websocket port (3012 mapped to {{ BITWARDEN_WS_LISTEN_PORT }})
+              location /notifications/hub {
+                  proxy_pass http://{{ BITWARDEN_LISTEN_HOST }}:{{ BITWARDEN_WS_LISTEN_PORT }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              # Everything else goes to the main app/API port (80 mapped to {{ BITWARDEN_LISTEN_PORT }})
+              location / {
+                  proxy_pass http://{{ BITWARDEN_LISTEN_HOST }}:{{ BITWARDEN_LISTEN_PORT }};
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  proxy_read_timeout 300s;
+                  proxy_send_timeout 300s;
+              }
+          }
+
+- name: Bitwarden | Reload nginx
+  ansible.builtin.service:
+      name: nginx
+      state: reloaded

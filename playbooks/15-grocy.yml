@@ -1,0 +1,248 @@
+---
+###############################################################################
+# Grocy (rootless podman + quadlet, user-scoped)
+###############################################################################
+- name: Grocy | Set derived vars / defaults
+  ansible.builtin.set_fact:
+    GROCY_HOST: "{{ GROCY_HOST | default('grocy.' ~ DOMAIN) }}"
+
+    # Service user + paths (aligns with your Trilium pattern)
+    GROCY_USER: "{{ GROCY_USER | default('grocy') }}"
+    GROCY_ROOT: "{{ GROCY_ROOT | default('/opt/grocy') }}"
+    GROCY_CONFIG_DIR: "{{ GROCY_CONFIG_DIR | default(GROCY_ROOT ~ '/config') }}"
+    GROCY_QUADLET_DIR: "/home/{{ GROCY_USER }}/.config/containers/systemd"
+
+    # Image + ports (LinuxServer image maps external 9283 to internal 80)
+    GROCY_IMAGE: "{{ GROCY_IMAGE | default('lscr.io/linuxserver/grocy:latest') }}"
+    GROCY_HOST_PORT: "{{ GROCY_HOST_PORT | default('9283') }}"
+    GROCY_CONTAINER_PORT: "{{ GROCY_CONTAINER_PORT | default('80') }}"
+
+    # Container env
+    GROCY_TZ: "{{ GROCY_TZ | default('Etc/UTC') }}"
+
+- name: Grocy | Ensure service user exists
+  ansible.builtin.user:
+    name: "{{ GROCY_USER }}"
+    home: "/home/{{ GROCY_USER }}"
+    shell: /bin/bash
+    state: present
+
+- name: Grocy | Read user uid/gid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ GROCY_USER }}"
+
+- name: Grocy | Set uid/gid facts
+  ansible.builtin.set_fact:
+    GROCY_UID: "{{ getent_passwd[GROCY_USER][1] }}"
+    GROCY_GID: "{{ getent_passwd[GROCY_USER][2] }}"
+
+# - name: Grocy | Ensure lingering is enabled (rootless systemd survives logout)
+#   block:
+#     - name: Grocy | Check lingering state
+#       ansible.builtin.command: "loginctl show-user {{ GROCY_USER }} -p Linger"
+#       register: grocy_linger
+#       changed_when: false
+#       failed_when: false
+
+#     - name: Grocy | Enable lingering
+#       ansible.builtin.command: "loginctl enable-linger {{ GROCY_USER }}"
+#       when: grocy_linger.rc != 0 or (grocy_linger.stdout is not search('Linger=yes'))
+#   become: true
+
+- name: Grocy | Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ GROCY_ROOT }}",       owner: root,          group: root,          mode: "0755" }
+    - { path: "{{ GROCY_CONFIG_DIR }}", owner: "{{ GROCY_USER }}", group: "{{ GROCY_USER }}", mode: "0755" }
+    - { path: "{{ GROCY_QUADLET_DIR }}", owner: "{{ GROCY_USER }}", group: "{{ GROCY_USER }}", mode: "0755" }
+  become: true
+
+- name: Grocy | Write Quadlet pod file
+  ansible.builtin.copy:
+    dest: "{{ GROCY_QUADLET_DIR }}/grocy.pod"
+    owner: "{{ GROCY_USER }}"
+    group: "{{ GROCY_USER }}"
+    mode: "0644"
+    content: |
+      [Pod]
+      PodName=grocy.pod
+      PublishPort=127.0.0.1:{{ GROCY_HOST_PORT }}:{{ GROCY_CONTAINER_PORT }}
+
+- name: Grocy | Write Quadlet container file
+  ansible.builtin.copy:
+    dest: "{{ GROCY_QUADLET_DIR }}/grocy.container"
+    owner: "{{ GROCY_USER }}"
+    group: "{{ GROCY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=grocy
+      Image={{ GROCY_IMAGE }}
+      Pod=grocy.pod
+
+      Environment=PUID={{ GROCY_UID }}
+      Environment=PGID={{ GROCY_GID }}
+      Environment=TZ={{ GROCY_TZ }}
+
+      Volume={{ GROCY_CONFIG_DIR }}:/config:Z
+
+      [Service]
+      Restart=always
+
+###############################################################################
+# Grocy | Root controlling rootless (Quadlet-generated; do not enable)
+###############################################################################
+
+- name: "Grocy | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+    - name: "Grocy | Get UID of {{ GROCY_USER }}"
+      ansible.builtin.command: "id -u {{ GROCY_USER }}"
+      register: grocy_uid
+      changed_when: false
+
+    - name: "Grocy | Set runtime facts"
+      ansible.builtin.set_fact:
+        GROCY_UID: "{{ grocy_uid.stdout | trim }}"
+        GROCY_XDG_RUNTIME_DIR: "/run/user/{{ grocy_uid.stdout | trim }}"
+        GROCY_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ grocy_uid.stdout | trim }}/bus"
+
+    - name: "Grocy | Ensure XDG runtime dir exists"
+      ansible.builtin.file:
+        path: "{{ GROCY_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ GROCY_USER }}"
+        group: "{{ GROCY_USER }}"
+        mode: "0700"
+
+    - name: "Grocy | Assert user manager responds"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ GROCY_USER }}@.host is-active default.target
+      changed_when: false
+      register: grocy_user_mgr
+      failed_when: grocy_user_mgr.rc != 0
+
+  become: true
+
+- name: "Grocy | systemd --user daemon-reload (via machine context)"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --user -M {{ GROCY_USER }}@.host daemon-reload
+  become: true
+  changed_when: false
+
+- name: "Grocy | Start services (generated; do not enable)"
+  block:
+    - name: "Grocy | Start pod (generated; do not enable)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ GROCY_USER }}@.host start grocy-pod.service
+      become: true
+      changed_when: false
+
+    - name: "Grocy | Start container (generated; do not enable)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ GROCY_USER }}@.host start grocy.service
+      become: true
+      changed_when: false
+
+  # rescue:
+  #   - name: "Grocy | Status (debug)"
+  #     ansible.builtin.command:
+  #       cmd: >-
+  #         systemctl --user -M {{ GROCY_USER }}@.host
+  #         status grocy.service grocy-pod.service --no-pager
+  #     become: true
+  #     changed_when: false
+  #     failed_when: false
+  #     register: grocy_status
+
+  #   - name: "Grocy | Journal (debug)"
+  #     ansible.builtin.command:
+  #       cmd: >-
+  #         journalctl --user -M {{ GROCY_USER }}@.host
+  #         -xeu grocy.service --no-pager
+  #     become: true
+  #     changed_when: false
+  #     failed_when: false
+  #     register: grocy_journal
+
+  #   - name: "Grocy | Show status"
+  #     ansible.builtin.debug:
+  #       var: grocy_status.stdout_lines
+
+  #   - name: "Grocy | Show journal"
+  #     ansible.builtin.debug:
+  #       var: grocy_journal.stdout_lines
+
+  #   - name: "Grocy | Fail after diagnostics"
+  #     ansible.builtin.fail:
+  #       msg: "Grocy service failed to start; see debug output above."
+
+##########################################
+# Nginx reverse proxy vhost
+##########################################
+
+- name: Grocy | Write nginx vhost (replaces placeholder)
+  block:
+    - name: Grocy | Remove old placeholder vhost if present
+      ansible.builtin.file:
+        path: "/etc/nginx/conf.d/{{ GROCY_HOST }}.conf"
+        state: absent
+
+    - name: Grocy | Install vhost
+      ansible.builtin.copy:
+        dest: "/etc/nginx/conf.d/{{ GROCY_HOST }}.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Redirect http to https
+          server {
+              listen {{ WG_SERVER_IP }}:80;
+              server_name {{ GROCY_HOST }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen {{  WG_SERVER_IP }}:443 ssl;
+              http2 on;
+              server_name {{ GROCY_HOST }};
+
+              include /etc/nginx/default.d/*.conf;
+              ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+              ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+              access_log /var/log/nginx/{{ GROCY_HOST }}_access.log main;
+              error_log  /var/log/nginx/{{ GROCY_HOST }}_error.log warn;
+
+              client_max_body_size 0;
+              underscores_in_headers on;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ GROCY_HOST_PORT }}/;
+
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Grocy | nginx config test
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Grocy | Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+  become: true

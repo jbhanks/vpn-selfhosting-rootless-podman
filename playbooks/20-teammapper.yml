@@ -1,0 +1,281 @@
+---
+- name: TeamMapper set derived vars defaults
+  ansible.builtin.set_fact:
+    TEAMMAPPER_USER: "{{ TEAMMAPPER_USER | default('teammapper') }}"
+    TEAMMAPPER_ROOT: "{{ TEAMMAPPER_ROOT | default('/opt/teammapper') }}"
+    TEAMMAPPER_ENV_DIR: "{{ TEAMMAPPER_ENV_DIR | default('/etc/teammapper') }}"
+    TEAMMAPPER_ENV_FILE: "{{ TEAMMAPPER_ENV_FILE | default('/etc/teammapper/teammapper.env') }}"
+    TEAMMAPPER_QUADLET_DIR: "{{ TEAMMAPPER_QUADLET_DIR | default('/home/' ~ (TEAMMAPPER_USER | default('teammapper')) ~ '/.config/containers/systemd') }}"
+
+    TEAMMAPPER_HOST: "{{ TEAMMAPPER_HOST | default('teammapper.' ~ DOMAIN) }}"
+    TEAMMAPPER_LISTEN_PORT: "{{ TEAMMAPPER_LISTEN_PORT | default('3011') | int }}"
+
+    TEAMMAPPER_IMAGE: "{{ TEAMMAPPER_IMAGE | default('ghcr.io/b310-digital/teammapper:latest') }}"
+
+    TEAMMAPPER_DB_HOST: "{{ TEAMMAPPER_DB_HOST | default('host.containers.internal') }}"
+    TEAMMAPPER_DB_PORT: "{{ TEAMMAPPER_DB_PORT | default('5432') | int }}"
+    TEAMMAPPER_DB_NAME: "{{ TEAMMAPPER_DB_NAME | default('teammapper_db') }}"
+    TEAMMAPPER_DB_USER: "{{ TEAMMAPPER_DB_USER | default('teammapper_user') }}"
+    TEAMMAPPER_DB_SSL: "{{ TEAMMAPPER_DB_SSL | default('false') }}"
+
+    TEAMMAPPER_DELETE_AFTER_DAYS: "{{ TEAMMAPPER_DELETE_AFTER_DAYS | default('30') | int }}"
+    TEAMMAPPER_MODE: "{{ TEAMMAPPER_MODE | default('PROD') }}"
+
+- name: TeamMapper assert required secrets provided
+  ansible.builtin.assert:
+    that:
+      - TEAMMAPPER_DB_PASSWORD is defined
+      - TEAMMAPPER_JWT_SECRET is defined
+    fail_msg: "You must define TEAMMAPPER_DB_PASSWORD and TEAMMAPPER_JWT_SECRET (vault or vars)."
+
+- name: TeamMapper ensure service user exists
+  ansible.builtin.user:
+    name: "{{ TEAMMAPPER_USER }}"
+    system: true
+    create_home: true
+    shell: /sbin/nologin
+
+- name: TeamMapper ensure directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ TEAMMAPPER_ROOT }}", owner: "{{ TEAMMAPPER_USER }}", group: "{{ TEAMMAPPER_USER }}", mode: "0750" }
+    - { path: "{{ TEAMMAPPER_ENV_DIR }}", owner: "root", group: "{{ TEAMMAPPER_USER }}", mode: "0750" }
+    - { path: "{{ TEAMMAPPER_QUADLET_DIR }}", owner: "{{ TEAMMAPPER_USER }}", group: "{{ TEAMMAPPER_USER }}", mode: "0755" }
+    - { path: "/var/www/html/{{ TEAMMAPPER_HOST }}", owner: "root", group: "root", mode: "0755" }
+
+- name: TeamMapper write env file
+  ansible.builtin.copy:
+    dest: "{{ TEAMMAPPER_ENV_FILE }}"
+    owner: root
+    group: "{{ TEAMMAPPER_USER }}"
+    mode: "0640"
+    content: |
+      MODE={{ TEAMMAPPER_MODE }}
+      BINDING=0.0.0.0
+
+      POSTGRES_DATABASE={{ TEAMMAPPER_DB_NAME }}
+      POSTGRES_HOST={{ TEAMMAPPER_DB_HOST }}
+      POSTGRES_PASSWORD={{ TEAMMAPPER_DB_PASSWORD }}
+      POSTGRES_PORT={{ TEAMMAPPER_DB_PORT }}
+      POSTGRES_SSL={{ TEAMMAPPER_DB_SSL }}
+      POSTGRES_SSL_REJECT_UNAUTHORIZED=false
+      POSTGRES_USER={{ TEAMMAPPER_DB_USER }}
+      POSTGRES_QUERY_TIMEOUT=100000
+      POSTGRES_STATEMENT_TIMEOUT=100000
+
+      DELETE_AFTER_DAYS={{ TEAMMAPPER_DELETE_AFTER_DAYS }}
+      JWT_SECRET={{ TEAMMAPPER_JWT_SECRET }}
+
+- name: TeamMapper | Derive runtime dir for user systemd (root controlling rootless)
+  block:
+    - name: TeamMapper | Get UID of {{ TEAMMAPPER_USER }}
+      ansible.builtin.command: "id -u {{ TEAMMAPPER_USER }}"
+      register: teammapper_uid
+      changed_when: false
+
+    - name: TeamMapper | Set runtime facts
+      ansible.builtin.set_fact:
+        TEAMMAPPER_UID: "{{ teammapper_uid.stdout | trim }}"
+        TEAMMAPPER_XDG_RUNTIME_DIR: "/run/user/{{ teammapper_uid.stdout | trim }}"
+        TEAMMAPPER_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ teammapper_uid.stdout | trim }}/bus"
+
+    - name: TeamMapper | Ensure XDG runtime dir exists
+      ansible.builtin.file:
+        path: "{{ TEAMMAPPER_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ TEAMMAPPER_USER }}"
+        group: "{{ TEAMMAPPER_USER }}"
+        mode: "0700"
+
+    - name: TeamMapper | Ensure user manager is started (user@UID)
+      ansible.builtin.systemd:
+        name: "user@{{ TEAMMAPPER_UID }}.service"
+        state: started
+  become: true
+####################
+####################################################################
+# Postgres
+#####################################################################
+
+- name: "TeamMapper | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "TeamMapper | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: teammapper_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "TeamMapper | Postgres: allow podman subnet (teammapper -> teammapper)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ teammapper_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ TEAMMAPPER_DB_NAME }}"
+        users: "{{ TEAMMAPPER_DB_USER }}"
+        source: "{{ TEAMMAPPER_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: TEAMMAPPER_PODMAN_SUBNET is defined
+
+    - name: "TeamMapper | Postgres: allow podman subnet (postgres -> teammapper db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ teammapper_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ TEAMMAPPER_DB_NAME }}"
+        users: postgres
+        source: "{{ TEAMMAPPER_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: TEAMMAPPER_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "TeamMapper | Postgres: allow samehost (teammapper -> teammapper)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ teammapper_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ TEAMMAPPER_DB_NAME }}"
+        users: "{{ TEAMMAPPER_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "TeamMapper | Postgres: allow samehost (postgres -> teammapper db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ teammapper_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ TEAMMAPPER_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "TeamMapper | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "TeamMapper | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ TEAMMAPPER_DB_USER }}"
+        password: "{{ TEAMMAPPER_DB_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "TeamMapper | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ TEAMMAPPER_DB_NAME }}"
+        owner: "{{ TEAMMAPPER_DB_USER }}"
+        state: present
+
+
+# - name: TeamMapper enable linger for rootless user services
+#   ansible.builtin.command:
+#     cmd: "loginctl enable-linger {{ TEAMMAPPER_USER }}"
+#   changed_when: false
+
+- name: TeamMapper install quadlet container unit
+  ansible.builtin.copy:
+    dest: "{{ TEAMMAPPER_QUADLET_DIR }}/teammapper.container"
+    owner: "{{ TEAMMAPPER_USER }}"
+    group: "{{ TEAMMAPPER_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=TeamMapper container
+      After=network-online.target
+
+      [Container]
+      Image={{ TEAMMAPPER_IMAGE }}
+      ContainerName=teammapper
+      EnvironmentFile={{ TEAMMAPPER_ENV_FILE }}
+      PublishPort=127.0.0.1:{{ TEAMMAPPER_LISTEN_PORT }}:3000
+      AddHost=host.containers.internal:host-gateway
+      Pull=missing
+
+      [Install]
+      WantedBy=default.target
+
+- name: "TeamMapper | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ TEAMMAPPER_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ TEAMMAPPER_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ TEAMMAPPER_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+
+- name: "TeamMapper | Start container service (generated; do not enable)"
+  block:
+    - name: "TeamMapper | Start service"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ TEAMMAPPER_USER }}@.host --user
+          start teammapper.service
+      changed_when: false
+
+- name: Nginx write vhost for TeamMapper
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ TEAMMAPPER_HOST }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ TEAMMAPPER_HOST }};
+          return 301 https://$host$request_uri;
+      }
+      server {
+          listen {{  WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ TEAMMAPPER_HOST }};
+          include /etc/nginx/default.d/*.conf;
+
+          root /var/www/html/{{ TEAMMAPPER_HOST }};
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log  /var/log/nginx/{{ TEAMMAPPER_HOST }}_access.log  main;
+          error_log   /var/log/nginx/{{ TEAMMAPPER_HOST }}_error.log;
+
+          location / {
+              proxy_pass http://127.0.0.1:{{ TEAMMAPPER_LISTEN_PORT }}/;
+
+              proxy_http_version 1.1;
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "Upgrade";
+          }
+      }
+
+- name: "TeamMapper | Reload nginx"
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded
+
+

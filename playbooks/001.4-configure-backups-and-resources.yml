@@ -1,0 +1,89 @@
+# AWS CLI + Backblaze configuration and resource downloads
+
+- name: "AWS CLI: Ensure awscli installed for ADMINUSER"
+  ansible.builtin.pip:
+    name: awscli
+    state: present
+    executable: pip3
+    extra_args: --user
+  become: true
+  become_user: "{{ ADMINUSER }}"
+  environment:
+    HOME: "/home/{{ ADMINUSER }}"
+
+- name: "AWS CLI: Ensure ~/.aws directory exists"
+  ansible.builtin.file:
+    path: "/home/{{ ADMINUSER }}/.aws"
+    state: directory
+    owner: "{{ ADMINUSER }}"
+    group: "{{ ADMINUSER }}"
+    mode: "0700"
+
+- name: "AWS CLI: Configure Backblaze profile"
+  ansible.builtin.shell: |
+    aws configure set aws_access_key_id "{{ B2ID }}" --profile backblaze
+    aws configure set aws_secret_access_key "{{ B2KEY }}" --profile backblaze
+    aws configure set region "{{ B2ENDPOINT.split('.')[1] }}" --profile backblaze
+    aws configure set output text --profile backblaze
+  become: true
+  become_user: "{{ ADMINUSER }}"
+  environment:
+    HOME: "/home/{{ ADMINUSER }}"
+    PATH: "/home/{{ ADMINUSER }}/.local/bin:{{ ansible_env.PATH }}"
+  args:
+    executable: /bin/bash
+
+- name: "B2: Ensure pgdumps folder exists in bucket"
+  ansible.builtin.shell: |
+    aws s3api put-object       --bucket "{{ BACKUPBUCKET }}"       --key "pgdumps_{{ DOMAIN }}/"       --content-length 0       --profile backblaze       --region "{{ B2ENDPOINT.split('.')[1] }}"       --endpoint-url="https://{{ B2ENDPOINT }}"       --cli-connect-timeout 10       --cli-read-timeout 20
+  become: true
+  become_user: "{{ ADMINUSER }}"
+  environment:
+    HOME: "/home/{{ ADMINUSER }}"
+    PATH: "/home/{{ ADMINUSER }}/.local/bin:{{ ansible_env.PATH }}"
+  args:
+    executable: /bin/bash
+  register: b2_pgdumps_dir
+  retries: 3
+  delay: 5
+  until: b2_pgdumps_dir.rc == 0
+
+- name: "Resources: Ensure site-resources directory exists"
+  ansible.builtin.file:
+    path: "/home/{{ ADMINUSER }}/site-resources"
+    state: directory
+    owner: "{{ ADMINUSER }}"
+    group: "{{ ADMINUSER }}"
+    mode: "0755"
+
+- name: "Resources: Download papyrus image"
+  ansible.builtin.shell: |
+    aws s3api get-object       --bucket "{{ RESOURCE_BUCKET }}"       --key "papyrus_transparent_glow_smaller.png"       --profile backblaze       --region "{{ B2ENDPOINT.split('.')[1] }}"       --endpoint-url="https://{{ B2ENDPOINT }}"       --cli-connect-timeout 10       --cli-read-timeout 20       "site-resources/papyrus_transparent.png"
+  args:
+    chdir: "/home/{{ ADMINUSER }}"
+    executable: /bin/bash
+  become: true
+  become_user: "{{ ADMINUSER }}"
+  environment:
+    HOME: "/home/{{ ADMINUSER }}"
+    PATH: "/home/{{ ADMINUSER }}/.local/bin:{{ ansible_env.PATH }}"
+  register: papyrus_download
+  retries: 3
+  delay: 5
+  until: papyrus_download.rc == 0
+
+- name: "Resources: Download MedusaGothic font"
+  ansible.builtin.shell: |
+    aws s3api get-object       --bucket "{{ RESOURCE_BUCKET }}"       --key "MedusaGothic.woff2"       --profile backblaze       --region "{{ B2ENDPOINT.split('.')[1] }}"       --endpoint-url="https://{{ B2ENDPOINT }}"       --cli-connect-timeout 10       --cli-read-timeout 20       "site-resources/MedusaGothic.woff2"
+  args:
+    chdir: "/home/{{ ADMINUSER }}"
+    executable: /bin/bash
+  become: true
+  become_user: "{{ ADMINUSER }}"
+  environment:
+    HOME: "/home/{{ ADMINUSER }}"
+    PATH: "/home/{{ ADMINUSER }}/.local/bin:{{ ansible_env.PATH }}"
+  register: medusa_download
+  retries: 3
+  delay: 5
+  until: medusa_download.rc == 0

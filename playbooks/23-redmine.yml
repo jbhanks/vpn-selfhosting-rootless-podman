@@ -1,0 +1,308 @@
+---
+- name: "Redmine | Set derived vars / defaults"
+  ansible.builtin.set_fact:
+    REDMINE_USER: "{{ REDMINE_USER | default('redmine') }}"
+    REDMINE_CONTAINER_NAME: "{{ REDMINE_CONTAINER_NAME | default('redmine') }}"
+    REDMINE_IMAGE: "{{ REDMINE_IMAGE | default('docker.io/library/redmine:latest') }}"
+
+    REDMINE_ROOT: "{{ REDMINE_ROOT | default('/opt/redmine') }}"
+    REDMINE_ENV_DIR: "{{ REDMINE_ENV_DIR | default('/etc/redmine') }}"
+
+    # Reverse proxy / site identity
+    REDMINE_HOST: "{{ REDMINE_HOST | default('redmine.' ~ DOMAIN) }}"
+    REDMINE_PORT: "{{ REDMINE_PORT | default(3002) | int }}"
+
+    # Host Postgres connection details (rootless containers reach host via host.containers.internal)
+    REDMINE_DB_HOST: "{{ REDMINE_DB_HOST | default('host.containers.internal') }}"
+    REDMINE_DB_PORT: "{{ REDMINE_DB_PORT | default(DBPORT) | int }}"
+    REDMINE_DB_NAME: "{{ REDMINE_DB_NAME | default('redmine') }}"
+    REDMINE_DB_USER: "{{ REDMINE_DB_USER | default('redmine') }}"
+    REDMINE_DB_PASSWORD: "{{ REDMINE_DB_PASSWORD | default(omit) }}"
+
+    # Optional: if you track a podman subnet for pg_hba rules (like your other tasks)
+    # REDMINE_PODMAN_SUBNET: "10.89.0.0/24"
+
+    # Rails secret (optional; Redmine can auto-generate, but set it if you want stability across rebuilds)
+    REDMINE_SECRET_KEY_BASE: "{{ REDMINE_SECRET_KEY_BASE | default(omit) }}"
+
+- name: "Redmine | derive vars from above vars"
+  ansible.builtin.set_fact:
+    REDMINE_ENV_FILE: "{{ REDMINE_ENV_FILE | default(REDMINE_ENV_DIR ~ '/redmine.env') }}"
+    REDMINE_QUADLET_DIR: "{{ REDMINE_QUADLET_DIR | default('/home/' ~ (REDMINE_USER | default('redmine')) ~ '/.config/containers/systemd') }}"
+
+- name: "Redmine | Require DB password in vars"
+  ansible.builtin.assert:
+    that:
+      - REDMINE_DB_PASSWORD is defined
+      - (REDMINE_DB_PASSWORD | string | length) > 0
+    fail_msg: "Set REDMINE_DB_PASSWORD (vault/vars)."
+
+# - name: "Redmine | Ensure service user exists"
+#   ansible.builtin.user:
+#     name: "{{ REDMINE_USER }}"
+#     system: true
+#     create_home: true
+#     shell: /sbin/nologin
+#     state: present
+
+# - name: "Redmine | Enable linger for service user"
+#   ansible.builtin.command: "loginctl enable-linger {{ REDMINE_USER }}"
+#   changed_when: false
+
+- name: "Redmine | Ensure directories exist"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ REDMINE_ROOT }}",              owner: "root",          group: "root",           mode: "0755" }
+    - { path: "{{ REDMINE_ROOT }}/files",        owner: "{{ REDMINE_USER }}", group: "{{ REDMINE_USER }}", mode: "0750" }
+    - { path: "{{ REDMINE_ROOT }}/plugins",      owner: "{{ REDMINE_USER }}", group: "{{ REDMINE_USER }}", mode: "0750" }
+    - { path: "{{ REDMINE_ROOT }}/themes",       owner: "{{ REDMINE_USER }}", group: "{{ REDMINE_USER }}", mode: "0750" }
+    - { path: "{{ REDMINE_ENV_DIR }}",           owner: "root",          group: "{{ REDMINE_USER }}", mode: "0750" }
+    - { path: "{{ REDMINE_QUADLET_DIR }}",       owner: "{{ REDMINE_USER }}", group: "{{ REDMINE_USER }}", mode: "0750" }
+
+- name: "Redmine | Write environment file"
+  ansible.builtin.copy:
+    dest: "{{ REDMINE_ENV_FILE }}"
+    owner: root
+    group: "{{ REDMINE_USER }}"
+    mode: "0640"
+    content: |
+      # Redmine official image env vars (Postgres)
+      # See: https://hub.docker.com/_/redmine
+      REDMINE_DB_POSTGRES={{ REDMINE_DB_HOST }}
+      REDMINE_DB_PORT={{ REDMINE_DB_PORT }}
+      REDMINE_DB_USERNAME={{ REDMINE_DB_USER }}
+      REDMINE_DB_PASSWORD={{ REDMINE_DB_PASSWORD }}
+      REDMINE_DB_DATABASE={{ REDMINE_DB_NAME }}
+      {% if REDMINE_SECRET_KEY_BASE is defined %}
+      SECRET_KEY_BASE={{ REDMINE_SECRET_KEY_BASE }}
+      {% endif %}
+  # env var meanings and names are from the Redmine official image docs :contentReference[oaicite:1]{index=1}
+
+- name: "Redmine | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+    - name: "Redmine | Get UID of {{ REDMINE_USER }}"
+      ansible.builtin.command: "id -u {{ REDMINE_USER }}"
+      register: redmine_uid
+      changed_when: false
+
+    - name: "Redmine | Set XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS"
+      ansible.builtin.set_fact:
+        REDMINE_XDG_RUNTIME_DIR: "/run/user/{{ redmine_uid.stdout | trim }}"
+        REDMINE_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ redmine_uid.stdout | trim }}/bus"
+
+# --------------------------------------------------------------------
+# Host Postgres: pg_hba + role/db
+# --------------------------------------------------------------------
+- name: "Redmine | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "Redmine | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: redmine_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "Redmine | Postgres: allow podman subnet (redmine -> redmine)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ redmine_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ REDMINE_DB_NAME }}"
+        users: "{{ REDMINE_DB_USER }}"
+        source: "{{ REDMINE_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: REDMINE_PODMAN_SUBNET is defined
+
+    - name: "Redmine | Postgres: allow podman subnet (postgres -> redmine db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ redmine_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ REDMINE_DB_NAME }}"
+        users: postgres
+        source: "{{ REDMINE_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: REDMINE_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "Redmine | Postgres: allow samehost (redmine -> redmine)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ redmine_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ REDMINE_DB_NAME }}"
+        users: "{{ REDMINE_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Redmine | Postgres: allow samehost (postgres -> redmine db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ redmine_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ REDMINE_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Redmine | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "Redmine | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ REDMINE_DB_USER }}"
+        password: "{{ REDMINE_DB_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "Redmine | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ REDMINE_DB_NAME }}"
+        owner: "{{ REDMINE_DB_USER }}"
+        state: present
+
+- name: "Redmine | Rootless Podman: ensure subuid/subgid ranges exist"
+  become: true
+  block:
+    - name: "Redmine | Check /etc/subuid for {{ REDMINE_USER }}"
+      ansible.builtin.command: "grep -E '^{{ REDMINE_USER }}:' /etc/subuid"
+      register: redmine_subuid
+      changed_when: false
+      failed_when: false
+
+    - name: "Redmine | Check /etc/subgid for {{ REDMINE_USER }}"
+      ansible.builtin.command: "grep -E '^{{ REDMINE_USER }}:' /etc/subgid"
+      register: redmine_subgid
+      changed_when: false
+      failed_when: false
+
+    # Add a default range if missing. Pick a range convention that won't collide with your other service users.
+    - name: "Redmine | Add subuid range (if missing)"
+      ansible.builtin.command: "usermod --add-subuids 200000-265535 {{ REDMINE_USER }}"
+      when: redmine_subuid.rc != 0
+
+    - name: "Redmine | Add subgid range (if missing)"
+      ansible.builtin.command: "usermod --add-subgids 200000-265535 {{ REDMINE_USER }}"
+      when: redmine_subgid.rc != 0
+
+- name: "Redmine | Rootless Podman: migrate storage after subuid/subgid changes"
+  become: true
+  become_user: "{{ REDMINE_USER }}"
+  ansible.builtin.command: "podman system migrate"
+  changed_when: false
+  when: redmine_subuid.rc != 0 or redmine_subgid.rc != 0
+
+# --------------------------------------------------------------------
+# Quadlet (rootless): redmine container
+# --------------------------------------------------------------------
+- name: "Redmine | Install quadlet container unit"
+  ansible.builtin.copy:
+    dest: "{{ REDMINE_QUADLET_DIR }}/{{ REDMINE_CONTAINER_NAME }}.container"
+    owner: "{{ REDMINE_USER }}"
+    group: "{{ REDMINE_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Redmine (rootless Podman)
+
+      [Container]
+      ContainerName={{ REDMINE_CONTAINER_NAME }}
+      Image={{ REDMINE_IMAGE }}
+
+      # Bind only on localhost; nginx will reverse-proxy.
+      PublishPort=127.0.0.1:{{ REDMINE_PORT }}:3000
+
+      # Persistent storage
+      Volume={{ REDMINE_ROOT }}/files:/usr/src/redmine/files:Z
+      Volume={{ REDMINE_ROOT }}/plugins:/usr/src/redmine/plugins:Z
+      Volume={{ REDMINE_ROOT }}/themes:/usr/src/redmine/public/themes:Z
+
+      EnvironmentFile={{ REDMINE_ENV_FILE }}
+
+      # IMPORTANT for host-Postgres-on-localhost with rootless networking:
+      Network=slirp4netns:allow_host_loopback=true
+
+- name: "Redmine | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ REDMINE_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ REDMINE_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ REDMINE_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+- name: "Redmine | Start container service (generated; do not enable)"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --machine={{ REDMINE_USER }}@.host --user
+      start {{ REDMINE_CONTAINER_NAME }}.service
+  changed_when: false
+
+# --------------------------------------------------------------------
+# Nginx vhost (host-level reverse proxy)
+# --------------------------------------------------------------------
+- name: "Redmine | Nginx vhost"
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ REDMINE_HOST }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ REDMINE_HOST }};
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen {{  WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ REDMINE_HOST }};
+
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log  /var/log/nginx/{{ REDMINE_HOST }}_access.log  main;
+          error_log   /var/log/nginx/{{ REDMINE_HOST }}_error.log;
+
+          location / {
+              proxy_pass http://127.0.0.1:{{ REDMINE_PORT }};
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              client_max_body_size 50m;
+              proxy_read_timeout 300;
+          }
+      }
+
+- name: "Redmine | Reload nginx"
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

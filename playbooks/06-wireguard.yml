@@ -1,0 +1,360 @@
+---
+- name: "WireGuard | Set WireGuard facts"
+  ansible.builtin.set_fact:
+      WG_ENDPOINT_HOST: "{{ ansible_host | default(inventory_hostname) }}"
+
+- name: "WireGuard | Install packages on server"
+  become: true
+  ansible.builtin.dnf:
+      name:
+          - wireguard-tools
+          - qrencode
+      state: present
+
+- name: "WireGuard | Ensure EPEL (needed for UFW on Alma)"
+  become: true
+  ansible.builtin.dnf:
+      name: epel-release
+      state: present
+
+- name: "WireGuard | Install UFW on server"
+  become: true
+  ansible.builtin.dnf:
+      name: ufw
+      state: present
+
+- name: "WireGuard | Enable UFW service"
+  become: true
+  ansible.builtin.systemd:
+      name: ufw
+      enabled: true
+      state: started
+
+- name: "WireGuard | Ensure local Secrets/wireguard directory exists"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.file:
+      path: "{{ playbook_dir }}/Secrets/wireguard"
+      state: directory
+      mode: "0700"
+
+- name: "WireGuard | Generate server private key on controller (if missing)"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.shell: |
+      set -euo pipefail
+      umask 077
+      test -f "{{ playbook_dir }}/Secrets/wireguard/{{ inventory_hostname }}.server.key" || wg genkey > "{{ playbook_dir }}/Secrets/wireguard/{{ inventory_hostname }}.server.key"
+  args:
+      executable: /bin/bash
+  changed_when: false
+
+- name: "WireGuard | Ensure local Secrets/wireguard/clients directory exists"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.file:
+      path: "{{ playbook_dir }}/Secrets/wireguard/clients"
+      state: directory
+      mode: "0700"
+
+- name: "WireGuard | Derive server public key on controller"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.shell: |
+      set -euo pipefail
+      wg pubkey < "{{ playbook_dir }}/Secrets/wireguard/{{ inventory_hostname }}.server.key" > "{{ playbook_dir }}/Secrets/wireguard/{{ inventory_hostname }}.server.pub"
+  args:
+      executable: /bin/bash
+  changed_when: false
+
+- name: "WireGuard | Read server keys into facts (controller)"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.set_fact:
+      WG_SERVER_PRIVKEY: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/Secrets/wireguard/' ~ inventory_hostname ~ '.server.key') | trim }}"
+      WG_SERVER_PUBKEY: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/Secrets/wireguard/' ~ inventory_hostname ~ '.server.pub') | trim }}"
+
+- name: "WireGuard | Set defaults for client bundle generation"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.set_fact:
+      WG_CLIENT_IP_START: "{{ WG_CLIENT_IP_START | default('10.99.99.10') }}"
+      WG_CLIENT_ALLOWED_IPS: "{{ WG_CLIENT_ALLOWED_IPS | default(WG_SUBNET_CIDR) }}"
+
+- name: "WireGuard | Choose controller client"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.set_fact:
+      WG_CONTROLLER_CLIENT: "{{ client_machines[0] }}"
+  
+- name: "WireGuard | Compute controller VPN IP from client_machines ordering"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.set_fact:
+      WG_CONTROLLER_OFFSET: "{{ client_machines.index(WG_CONTROLLER_CLIENT) | int }}"
+      WG_CLIENT_IP: "{{ WG_CLIENT_IP_START.split('.')[0] }}.{{ WG_CLIENT_IP_START.split('.')[1] }}.{{ WG_CLIENT_IP_START.split('.')[2] }}.{{ (WG_CLIENT_IP_START.split('.')[3] | int) + (client_machines.index(WG_CONTROLLER_CLIENT) | int) }}"
+
+
+- name: "WireGuard | Generate per-client keypairs on controller (if missing)"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.shell: |
+      set -euo pipefail
+      umask 077
+      test -f "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.key" || wg genkey > "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.key"
+      wg pubkey < "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.key" > "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.pub"
+  args:
+      executable: /bin/bash
+  loop: "{{ client_machines }}"
+  changed_when: false
+
+- name: "WireGuard | Write per-client peer stanzas (controller)"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.copy:
+      dest: "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.peer"
+      mode: "0600"
+      content: |
+          [Peer]
+          PublicKey = {{ lookup('ansible.builtin.file', playbook_dir ~ '/Secrets/wireguard/clients/' ~ item ~ '.pub') | trim }}
+          AllowedIPs = {{ WG_CLIENT_IP_START.split('.')[0] }}.{{ WG_CLIENT_IP_START.split('.')[1] }}.{{ WG_CLIENT_IP_START.split('.')[2] }}.{{ (WG_CLIENT_IP_START.split('.')[3] | int) + (client_machines.index(item) | int) }}/32
+  loop: "{{ client_machines }}"
+  changed_when: false
+
+- name: "WireGuard | Write per-client configs (controller bundles)"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.copy:
+      dest: "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.conf"
+      mode: "0600"
+      content: |
+          [Interface]
+          PrivateKey = {{ lookup('ansible.builtin.file', playbook_dir ~ '/Secrets/wireguard/clients/' ~ item ~ '.key') | trim }}
+          Address = {{ WG_CLIENT_IP_START.split('.')[0] }}.{{ WG_CLIENT_IP_START.split('.')[1] }}.{{ WG_CLIENT_IP_START.split('.')[2] }}.{{ (WG_CLIENT_IP_START.split('.')[3] | int) + (client_machines.index(item) | int) }}/32
+          DNS = {{ WG_SERVER_IP }}
+
+          [Peer]
+          PublicKey = {{ WG_SERVER_PUBKEY }}
+          Endpoint = {{ WG_ENDPOINT_HOST }}:{{ WG_PORT }}
+          AllowedIPs = {{ WG_CLIENT_ALLOWED_IPS }}
+          PersistentKeepalive = 25
+  loop: "{{ client_machines }}"
+  changed_when: false
+
+- name: "WireGuard | Ensure /etc/wireguard exists on controller"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.file:
+      path: /etc/wireguard
+      state: directory
+      owner: root
+      group: root
+      mode: "0700"
+
+- name: "WireGuard | Save wg1.conf on controller from generated bundle"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.copy:
+      src: "{{ playbook_dir }}/Secrets/wireguard/clients/{{ WG_CONTROLLER_CLIENT }}.conf"
+      dest: /etc/wireguard/wg1.conf
+      owner: root
+      group: root
+      mode: "0600"
+      remote_src: true
+
+- name: "WireGuard | Ensure /etc/wireguard exists on server"
+  become: true
+  ansible.builtin.file:
+      path: /etc/wireguard
+      state: directory
+      owner: root
+      group: root
+      mode: "0700"
+
+- name: "WireGuard | Ensure /etc/wireguard/clients exists on server"
+  become: true
+  ansible.builtin.file:
+      path: /etc/wireguard/clients
+      state: directory
+      owner: root
+      group: root
+      mode: "0700"
+
+- name: "WireGuard | Write wg0 base (interface-only) on server"
+  become: true
+  ansible.builtin.copy:
+      dest: /etc/wireguard/clients/00-wg0.base
+      owner: root
+      group: root
+      mode: "0600"
+      content: |
+          [Interface]
+          Address = {{ WG_SERVER_IP }}/24
+          ListenPort = {{ WG_PORT }}
+          PrivateKey = {{ WG_SERVER_PRIVKEY }}
+
+- name: "WireGuard | Deploy per-client peer files to server"
+  become: true
+  ansible.builtin.copy:
+      src: "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.peer"
+      dest: "/etc/wireguard/clients/10-{{ item }}.peer"
+      owner: root
+      group: root
+      mode: "0600"
+  loop: "{{ client_machines }}"
+
+- name: "WireGuard | Assemble /etc/wireguard/wg0.conf from base + peers"
+  become: true
+  ansible.builtin.assemble:
+      src: /etc/wireguard/clients
+      dest: /etc/wireguard/wg0.conf
+      owner: root
+      group: root
+      mode: "0600"
+      regexp: '^(00-wg0\.base|10-.*\.peer)$'
+      delimiter: "\n\n"
+
+- name: "WireGuard | Ensure wg0 is enabled and restarted on server"
+  become: true
+  ansible.builtin.systemd:
+      name: "wg-quick@wg0"
+      enabled: true
+      state: restarted
+      daemon_reload: true
+
+- name: "WireGuard | Show wg0 status on server"
+  become: true
+  ansible.builtin.command: "wg show wg0"
+  changed_when: false
+
+- name: "WireGuard | Bring wg0 down on controller if it is up (switch away from old VPN)"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.command: "wg-quick down wg0"
+  failed_when: false
+  changed_when: false
+
+- name: "Controller DNS | Ensure systemd-resolved is enabled and running"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.systemd:
+      name: systemd-resolved.service
+      enabled: true
+      state: started
+
+- name: "Controller DNS | Ensure /etc/resolv.conf points to systemd-resolved stub"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.file:
+      src: /run/systemd/resolve/stub-resolv.conf
+      dest: /etc/resolv.conf
+      state: link
+      force: true
+
+- name: "WireGuard | Reset failed state for wg1 unit (controller)"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.command: "systemctl reset-failed wg-quick@wg1"
+  changed_when: false
+
+- name: "WireGuard | Stop wg1 unit on controller if it exists"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.systemd:
+      name: "wg-quick@wg1"
+      state: stopped
+  failed_when: false
+
+- name: "WireGuard | Ensure wg1 is enabled and started on controller"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.systemd:
+      name: "wg-quick@wg1"
+      enabled: true
+      state: started
+      daemon_reload: true
+
+- name: "WireGuard | Verify wg1 interface exists on controller"
+  delegate_to: localhost
+  run_once: true
+  become: true
+  ansible.builtin.command: "wg show wg1"
+  changed_when: false
+
+- name: "UFW | Allow WireGuard UDP port"
+  become: true
+  community.general.ufw:
+      rule: allow
+      port: "{{ WG_PORT }}"
+      proto: udp
+
+- name: "UFW | Ensure ufw is still enabled"
+  become: true
+  community.general.ufw:
+      state: enabled
+
+- name: "UFW | Reload ufw"
+  become: true
+  ansible.builtin.command: ufw reload
+  changed_when: false
+
+- name: "UFW | Verify WireGuard rule exists"
+  become: true
+  ansible.builtin.command: ufw status numbered
+  register: ufw_status
+  changed_when: false
+  failed_when: "(WG_PORT ~ '/udp') not in ufw_status.stdout"
+
+- name: "WireGuard | Ping test server over VPN from controller"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.command: "ping -c 3 -W 1 {{ WG_SERVER_IP }}"
+  changed_when: false
+
+- name: "WireGuard | Ping test controller over VPN from server"
+  become: true
+  ansible.builtin.command: "ping -c 3 -W 1 {{ WG_CLIENT_IP }}"
+  changed_when: false
+
+- name: "WireGuard | Show QR codes for generated client bundles (controller)"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.command: "qrencode -t ansiutf8 < {{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.conf"
+  loop: "{{ client_machines }}"
+  changed_when: false
+
+- name: "WireGuard | Save QR code PNG next to each generated client config (controller)"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  ansible.builtin.command:
+      argv:
+          - qrencode
+          - -t
+          - png
+          - -o
+          - "{{ playbook_dir }}/Secrets/wireguard/clients/{{ item }}.png"
+      stdin: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/Secrets/wireguard/clients/' ~ item ~ '.conf') }}"
+  loop: "{{ client_machines }}"
+  changed_when: false

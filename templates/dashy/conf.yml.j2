@@ -1,0 +1,206 @@
+appConfig:
+    language: en
+    layout: horizontal
+    iconSize: medium
+
+pageInfo:
+    title: Dashy
+
+sections:
+  - name: "Office & Collaboration"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "Nextcloud"
+        description: "Files, sync, and groupware"
+        url: "https://nextcloud.{{ DOMAIN }}"
+        target: "newtab"
+        id: "0_0_nextcloud"
+        icon: "{{ 'Nextcloud' | lower }}.png"
+
+  - name: "Notes & Knowledge"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "AppFlowy"
+        description: "Notes and projects"
+        url: "https://appflowy.{{ DOMAIN }}"
+        target: "newtab"
+        id: "1_0_appflowy"
+        icon: "{{ 'AppFlowy' | lower }}.png"
+
+      - title: "Trilium-Next"
+        description: "Personal knowledge base"
+        url: "https://trilium-next.{{ DOMAIN }}"
+        target: "newtab"
+        id: "1_1_trilium_next"
+        icon: "{{ 'Trilium-Next' | lower }}.png"
+
+      - title: "Joplin"
+        description: "Joplin Server"
+        url: "https://joplin.{{ DOMAIN }}"
+        target: "newtab"
+        id: "1_2_joplin"
+        icon: "{{ 'Joplin' | lower }}.png"
+
+      - title: "Memos"
+        description: "Quick notes"
+        url: "https://memos.{{ DOMAIN }}"
+        target: "newtab"
+        id: "1_3_memos"
+        icon: "{{ 'Memos' | lower }}.png"
+
+      - title: "XWiki"
+        description: "Long-term knowledge wiki"
+        url: "https://xwiki.{{ DOMAIN }}"
+        target: "newtab"
+        id: "1_4_xwiki"
+        icon: "{{ 'XWiki' | lower }}.png"
+
+  - name: "Dev & Projects"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "Gitea"
+        description: "Gitea - Git with a cup of tea!"
+        url: "https://gitea.{{ DOMAIN }}"
+        target: "newtab"
+        id: "2_0_gitea"
+        icon: "{{ 'Gitea' | lower }}.png"
+
+      - title: "Redmine"
+        description: "Project management"
+        url: "https://redmine.{{ DOMAIN }}"
+        target: "newtab"
+        id: "2_1_redmine"
+        icon: "{{ 'Redmine' | lower }}.png"
+
+      - title: "TeamMapper"
+        description: "Visual collaboration and mapping"
+        url: "https://teammapper.{{ DOMAIN }}"
+        target: "newtab"
+        id: "2_2_teammapper"
+        icon: "{{ 'TeamMapper' | lower }}.png"
+
+  - name: "Bookmarks & Reading"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "Linkwarden"
+        description: "Bookmarks and link archiving"
+        url: "https://linkwarden.{{ DOMAIN }}"
+        target: "newtab"
+        id: "3_0_linkwarden"
+        icon: "{{ 'Linkwarden' | lower }}.png"
+
+      - title: "Wallabag"
+        description: "Read-it-later"
+        url: "https://wallabag.{{ DOMAIN }}"
+        target: "newtab"
+        id: "3_1_wallabag"
+        icon: "{{ 'Wallabag' | lower }}.png"
+
+  - name: "Home & Inventory"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "Grocy"
+        description: "Groceries and household management"
+        url: "https://grocy.{{ DOMAIN }}"
+        target: "newtab"
+        id: "4_0_grocy"
+        icon: "{{ 'Grocy' | lower }}.png"
+
+      - title: "Koillection"
+        description: "Collections catalog"
+        url: "https://koillection.{{ DOMAIN }}"
+        target: "newtab"
+        id: "4_1_koillection"
+        icon: "{{ 'Koillection' | lower }}.png"
+
+  - name: "Finance"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "Firefly III"
+        description: "Personal finance manager"
+        url: "https://firefly3.{{ DOMAIN }}"
+        target: "newtab"
+        id: "5_0_firefly3"
+        icon: "firefly-iii.png"
+
+      - title: "Ghostfolio"
+        description: "Portfolio tracker"
+        url: "https://ghostfolio.{{ DOMAIN }}"
+        target: "newtab"
+        id: "5_1_ghostfolio"
+        icon: "{{ 'Ghostfolio' | lower }}.png"
+
+  - name: "Security"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "Bitwarden"
+        description: "Password manager"
+        url: "https://bitwarden.{{ DOMAIN }}"
+        target: "newtab"
+        id: "6_0_bitwarden"
+        icon: "{{ 'Bitwarden' | lower }}.png"
+
+  - name: "Location"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "OwnTracks"
+        description: "Location tracking"
+        url: "https://owntracks.{{ DOMAIN }}"
+        target: "newtab"
+        id: "7_0_owntracks"
+        icon: "{{ 'OwnTracks' | lower }}.png"
+
+  - name: "Observability"
+    displayData:
+        sortBy: default
+        rows: 1
+        cols: 1
+        collapsed: false
+        hideForGuests: false
+    items:
+      - title: "Grafana"
+        description: "Dashboards and alerting"
+        url: "https://grafana.{{ DOMAIN }}"
+        target: "newtab"
+        id: "8_0_grafana"
+        icon: "{{ 'Grafana' | lower }}.png"

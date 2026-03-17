@@ -1,0 +1,924 @@
+- name: AppFlowy | Set derived vars / defaults
+  ansible.builtin.set_fact:
+    APPFLOWY_NET_NAME: "{{ APPFLOWY_NET_NAME | default('appflowy_net') }}"
+    APPFLOWY_POD_NAME: "{{ APPFLOWY_POD_NAME | default('appflowy') }}"
+    APPFLOWY_ROOT: "{{ APPFLOWY_ROOT | default('/opt/appflowy-cloud') }}"
+    APPFLOWY_ENV_DIR: /etc/appflowy-cloud
+    APPFLOWY_USER: appflowy
+    APPFLOWY_QUADLET_DIR: /home/appflowy/.config/containers/systemd
+
+    # New: gate destructive "reset" behavior (stop/disable units + pod/container removal)
+    # Set true only when you explicitly want to wipe and rebuild the pod state.
+    APPFLOWY_RESET: "{{ APPFLOWY_RESET | default(false) }}"
+
+    # Keep existing name/path (do not drop it)
+    APPFLOWY_ENV_FILE: /etc/appflowy-cloud/appflowy.env
+
+    # New: split env files (common + gotrue-only)
+    APPFLOWY_ENV_FILE_COMMON: /etc/appflowy-cloud/appflowy-common.env
+    APPFLOWY_ENV_FILE_GOTRUE: /etc/appflowy-cloud/gotrue.env
+
+    APPFLOWY_HOST: "{{ APPFLOWY_HOST | default('appflowy.' ~ DOMAIN) }}"
+    # Host (nginx) will talk to loopback-published pod ports:
+    APPFLOWY_PUBLISH_CLOUD: "127.0.0.1:8000:8000"
+    APPFLOWY_PUBLISH_GOTRUE: "127.0.0.1:8081:8081"
+    APPFLOWY_PUBLISH_WEB: "127.0.0.1:3000:3000"
+    APPFLOWY_PUBLISH_ADMIN: "127.0.0.1:3100:3100"
+    APPFLOWY_PUBLISH_MINIO_API: "127.0.0.1:9000:9000"
+    APPFLOWY_PUBLISH_MINIO_CONSOLE: "127.0.0.1:9001:9001"
+    # Images (can be overridden in vars.yml)
+    APPFLOWY_IMG_REDIS: "{{ APPFLOWY_IMG_REDIS | default('docker.io/library/redis:7') }}"
+    APPFLOWY_IMG_MINIO: "{{ APPFLOWY_IMG_MINIO | default('docker.io/minio/minio:latest') }}"
+    APPFLOWY_IMG_GOTRUE: "{{ APPFLOWY_IMG_GOTRUE | default('docker.io/appflowyinc/gotrue:latest') }}"
+    APPFLOWY_IMG_CLOUD: "{{ APPFLOWY_IMG_CLOUD | default('docker.io/appflowyinc/appflowy_cloud:latest') }}"
+    APPFLOWY_IMG_WORKER: "{{ APPFLOWY_IMG_WORKER | default('docker.io/appflowyinc/appflowy_worker:latest') }}"
+    APPFLOWY_IMG_WEB: "{{ APPFLOWY_IMG_WEB | default('docker.io/appflowyinc/appflowy_web:latest') }}"
+    APPFLOWY_IMG_ADMIN: "{{ APPFLOWY_IMG_ADMIN | default('docker.io/appflowyinc/admin_frontend:latest') }}"
+    APPFLOWY_IMG_ADMIN_BRIDGE: "{{ APPFLOWY_IMG_ADMIN_BRIDGE | default('docker.io/alpine/socat:latest') }}"
+    # GoTrue defaults
+    APPFLOWY_GOTRUE_ADMIN_EMAIL: "{{ APPFLOWY_GOTRUE_ADMIN_EMAIL | default('admin@example.com') }}"
+    APPFLOWY_GOTRUE_JWT_SECRET: "{{ APPFLOWY_GOTRUE_JWT_SECRET | default('hello456') }}"
+
+- name: "AppFlowy | Preflight: ensure required vars exist"
+  ansible.builtin.assert:
+    that:
+      - DOMAIN is defined
+      - PGPASSWORD is defined
+      - DBPORT is defined
+      - GOTRUE_ADMIN_PASSWORD is defined
+      - MINIO_ROOT_PASSWORD is defined
+    fail_msg: >-
+      Missing required vars. Ensure DOMAIN, PGPASSWORD, DBPORT, GOTRUE_ADMIN_PASSWORD, MINIO_ROOT_PASSWORD
+      are present in vars.yml.
+
+- name: AppFlowy | Derive runtime dir for user systemd (root controlling rootless)
+  block:
+    - name: AppFlowy | Get UID of {{ APPFLOWY_USER }}
+      ansible.builtin.command: "id -u {{ APPFLOWY_USER }}"
+      register: appflowy_uid
+      changed_when: false
+
+    - name: AppFlowy | Set runtime facts
+      ansible.builtin.set_fact:
+        APPFLOWY_UID: "{{ appflowy_uid.stdout | trim }}"
+        APPFLOWY_XDG_RUNTIME_DIR: "/run/user/{{ appflowy_uid.stdout | trim }}"
+        APPFLOWY_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ appflowy_uid.stdout | trim }}/bus"
+
+    - name: AppFlowy | Ensure XDG runtime dir exists
+      ansible.builtin.file:
+        path: "{{ APPFLOWY_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ APPFLOWY_USER }}"
+        group: "{{ APPFLOWY_USER }}"
+        mode: "0700"
+
+    - name: AppFlowy | Ensure user manager is started (user@UID)
+      ansible.builtin.systemd:
+        name: "user@{{ APPFLOWY_UID }}.service"
+        state: started
+  become: true
+
+- name: AppFlowy | Ensure APPFLOWY_QUADLET_DIR exists (rootless)
+  ansible.builtin.file:
+    path: "{{ APPFLOWY_QUADLET_DIR }}"
+    state: directory
+    owner: appflowy
+    group: appflowy
+    mode: "0755"
+  become: true
+
+- name: "Postgres | Install pgvector for PostgreSQL 18"
+  become: true
+  ansible.builtin.dnf:
+    name: pgvector_18
+    state: present
+
+- name: "AppFlowy | Postgres: ensure pgvector extension exists"
+  community.postgresql.postgresql_ext:
+    name: vector
+    login_db: appflowy
+    state: present
+    login_host: 127.0.0.1
+    login_user: postgres
+    login_password: "{{ DBSUPERPASS }}"
+
+- name: "AppFlowy | Preflight: ensure podman is present and quadlet dir exists"
+  block:
+    - name: AppFlowy | Check podman is installed
+      ansible.builtin.command: sudo -u {{ APPFLOWY_USER }} podman --version
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      register: appflowy_podman_version
+      changed_when: false
+
+    - name: AppFlowy | Ensure quadlet dir exists (rootless)
+      ansible.builtin.file:
+        path: "{{ APPFLOWY_QUADLET_DIR }}"
+        state: directory
+        owner: "{{ APPFLOWY_USER }}"
+        group: "{{ APPFLOWY_USER }}"
+        mode: "0755"
+
+###############################################################################
+# RESET / CLEANUP (OPT-IN)
+#
+# You had two separate "stop/disable units" sections plus pod removal.
+# This consolidates them and makes the whole destructive cleanup opt-in:
+#   APPFLOWY_RESET: true
+###############################################################################
+- name: "AppFlowy | Reset: stop/disable units + remove pod/containers (opt-in)"
+  block:
+    - name: "AppFlowy | Reset: stop and disable prior units (user scope, rootless)"
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user disable --now {{ item }}
+      loop:
+        - "{{ APPFLOWY_POD_NAME }}-pod.service"
+        - appflowy-redis.service
+        - appflowy-minio.service
+        - appflowy-gotrue.service
+        - appflowy-cloud.service
+        - appflowy-worker.service
+        - appflowy-web.service
+        - appflowy-admin-frontend.service
+        # - appflowy-admin-frontend-bridge.service
+      changed_when: true
+      failed_when: false
+
+    - name: "AppFlowy | Reset: remove existing pod (if any)"
+      ansible.builtin.command: "sudo -u {{ APPFLOWY_USER }} podman pod rm -f {{ APPFLOWY_POD_NAME }}"
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      changed_when: true
+      failed_when: false
+
+    - name: "AppFlowy | Reset: remove leftover containers (if any)"
+      ansible.builtin.command: "sudo -u {{ APPFLOWY_USER }} podman rm -f {{ item }}"
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      loop:
+        - redis
+        - minio
+        - gotrue
+        - appflowy_cloud
+        - appflowy_worker
+        - appflowy_web
+        - admin_frontend
+        # - admin_frontend_bridge
+      changed_when: true
+      failed_when: false
+  become: true
+  when: APPFLOWY_RESET | bool
+
+- name: AppFlowy | Ensure podman.socket is enabled
+  ansible.builtin.systemd:
+    name: podman.socket
+    enabled: true
+    state: started
+
+
+- name: AppFlowy | Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ APPFLOWY_USER }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ APPFLOWY_ROOT }}", mode: "0755" }
+    - { path: "{{ APPFLOWY_ENV_DIR }}", mode: "0750" }
+
+- name: AppFlowy | Ensure MinIO volume exists
+  become: true
+
+  block:
+    - name: AppFlowy | Check volume exists
+      ansible.builtin.command: sudo -u {{ APPFLOWY_USER }} podman volume exists appflowy_minio_data
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      register: appflowy_vol_exists
+      changed_when: false
+      failed_when: false
+
+    - name: AppFlowy | Create volume if missing
+      ansible.builtin.command: sudo -u {{ APPFLOWY_USER }} podman volume create appflowy_minio_data
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      when: appflowy_vol_exists.rc != 0
+
+- name: AppFlowy | Ensure podman network exists
+  become: true
+
+  block:
+    - name: AppFlowy | Check network exists
+      ansible.builtin.command: "sudo -u {{ APPFLOWY_USER }} podman network exists {{ APPFLOWY_NET_NAME }}"
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      register: appflowy_net_exists
+      changed_when: false
+      failed_when: false
+
+    - name: AppFlowy | Create network if missing
+      ansible.builtin.command: "sudo -u {{ APPFLOWY_USER }} podman network create {{ APPFLOWY_NET_NAME }}"
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      when: appflowy_net_exists.rc != 0
+
+    - name: AppFlowy | Inspect network (JSON)
+      ansible.builtin.command: "sudo -u {{ APPFLOWY_USER }} podman network inspect {{ APPFLOWY_NET_NAME }}"
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      register: appflowy_net_inspect
+      changed_when: false
+
+    - name: AppFlowy | Parse network gateway/iface/subnet
+      ansible.builtin.set_fact:
+        APPFLOWY_NET_JSON: "{{ appflowy_net_inspect.stdout | from_json }}"
+        APPFLOWY_DNS_GATEWAY: "{{ (appflowy_net_inspect.stdout | from_json)[0].subnets[0].gateway }}"
+        APPFLOWY_PODMAN_IFACE: "{{ (appflowy_net_inspect.stdout | from_json)[0].network_interface }}"
+        APPFLOWY_PODMAN_SUBNET: "{{ (appflowy_net_inspect.stdout | from_json)[0].subnets[0].subnet }}"
+
+- name: AppFlowy | Write env file (COMMON)
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_ENV_FILE_COMMON }}"
+    owner: root
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0640"
+    content: |
+      # Public-facing URLs (what browsers/clients use)
+      APPFLOWY_BASE_URL=https://{{ APPFLOWY_HOST }}
+      APPFLOWY_WEB_URL=https://{{ APPFLOWY_HOST }}
+      APPFLOWY_WEBSOCKET_BASE_URL=wss://{{ APPFLOWY_HOST }}/ws/v2
+      APPFLOWY_WS_BASE_URL=wss://{{ APPFLOWY_HOST }}/ws/v2
+      API_EXTERNAL_URL=https://{{ APPFLOWY_HOST }}/gotrue
+      GOTRUE_SITE_URL=https://{{ APPFLOWY_HOST }}
+
+      # Internal service URLs (container-to-container)
+      # (GoTrue is exposed via nginx at /gotrue externally, but internally it is http://gotrue:8081)
+      # APPFLOWY_GOTRUE_BASE_URL=http://gotrue:8081
+      # APPFLOWY_GOTRUE_BASE_URL=https://{{ APPFLOWY_HOST }}/gotrue
+
+      APPFLOWY_GOTRUE_BASE_URL=https://{{ APPFLOWY_HOST }}/gotrue
+      AF_GOTRUE_URL=https://{{ APPFLOWY_HOST }}/gotrue
+      APPFLOWY_GOTRUE_EXT_URL=https://{{ APPFLOWY_HOST }}/gotrue
+      # NEXT_PUBLIC_GOTRUE_URL=https://{{ APPFLOWY_HOST }}/gotrue
+
+
+      # Database / Redis (host postgres via pod gateway + in-pod redis)
+      APPFLOWY_DATABASE_URL=postgres://appflowy:{{ DBUSERPASS }}@host.containers.internal:{{ DBPORT }}/appflowy
+      APPFLOWY_REDIS_URI=redis://redis:6379
+
+      # Worker-specific (THIS is what appflowy_worker reads)
+      APPFLOWY_ENVIRONMENT=production
+      APPFLOWY_WORKER_ENVIRONMENT=production
+      APPFLOWY_WORKER_DATABASE_URL=postgres://appflowy:{{ DBUSERPASS }}@host.containers.internal:{{ DBPORT }}/appflowy
+      APPFLOWY_WORKER_DATABASE_NAME=appflowy
+      APPFLOWY_WORKER_REDIS_URL=redis://redis:6379
+
+
+      DATABASE_URL=postgres://appflowy:{{ DBUSERPASS }}@host.containers.internal:{{ DBPORT }}/appflowy?search_path=auth
+      GOTRUE_DATABASE_URL=postgres://appflowy:{{ DBUSERPASS }}@host.containers.internal:{{ DBPORT }}/appflowy?search_path=auth
+
+      GOTRUE_ADMIN_EMAIL={{ APPFLOWY_GOTRUE_ADMIN_EMAIL }}
+      GOTRUE_ADMIN_PASSWORD={{ GOTRUE_ADMIN_PASSWORD }}
+      GOTRUE_JWT_SECRET={{ APPFLOWY_GOTRUE_JWT_SECRET }}
+      GOTRUE_JWT_EXP=604800
+      GOTRUE_DISABLE_SIGNUP=false
+      GOTRUE_MAILER_AUTOCONFIRM=true
+      GOTRUE_RATE_LIMIT_EMAIL_SENT=100
+      GOTRUE_DB_DRIVER=postgres
+
+      # S3 (MinIO)
+      APPFLOWY_S3_USE_MINIO=true
+      APPFLOWY_S3_MINIO_URL=http://minio:9000
+      APPFLOWY_S3_ACCESS_KEY=minio
+      APPFLOWY_S3_SECRET_KEY={{ MINIO_ROOT_PASSWORD }}
+      APPFLOWY_S3_BUCKET=appflowy
+      APPFLOWY_S3_REGION=us-east-1
+
+      ######################################################################
+      # PostgreSQL (host database accessed via pod gateway)
+      ######################################################################
+      POSTGRES_HOST=host.containers.internal
+      POSTGRES_PORT={{ DBPORT }}
+
+      # Superuser (used by gotrue + migrations)
+      POSTGRES_USER=postgres
+      POSTGRES_PASSWORD={{ PGPASSWORD }}
+      POSTGRES_DB=postgres
+      PGPASSWORD={{ PGPASSWORD }}
+
+
+- name: AppFlowy | Write env file (GOTRUE-only)
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_ENV_FILE_GOTRUE }}"
+    owner: root
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0640"
+    content: |
+      # Public-facing URLs (what browsers/clients use)
+      GOTRUE_SITE_URL=https://{{ APPFLOWY_HOST }}
+      API_EXTERNAL_URL=https://{{ APPFLOWY_HOST }}/gotrue
+
+      # Auth DB
+      DATABASE_URL=postgres://appflowy:{{ DBUSERPASS }}@host.containers.internal:{{ DBPORT }}/appflowy?search_path=auth
+      GOTRUE_DATABASE_URL=postgres://appflowy:{{ DBUSERPASS }}@host.containers.internal:{{ DBPORT }}/appflowy?search_path=auth
+
+      # JWT / runtime
+      GOTRUE_JWT_SECRET={{ APPFLOWY_GOTRUE_JWT_SECRET }}
+      GOTRUE_JWT_EXP=604800
+      GOTRUE_DISABLE_SIGNUP=false
+      GOTRUE_MAILER_AUTOCONFIRM=true
+      GOTRUE_RATE_LIMIT_EMAIL_SENT=100
+      GOTRUE_DB_DRIVER=postgres
+
+
+- name: AppFlowy | Point legacy env file (APPFLOWY_ENV_FILE) at COMMON
+  ansible.builtin.file:
+    src: "{{ APPFLOWY_ENV_FILE_COMMON }}"
+    dest: "{{ APPFLOWY_ENV_FILE }}"
+    state: link
+    force: true
+
+
+- name: "AppFlowy | Write quadlet: pod"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/{{ APPFLOWY_POD_NAME }}.pod"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0644"
+    content: |
+      [Pod]
+      PodName={{ APPFLOWY_POD_NAME }}
+      Network={{ APPFLOWY_NET_NAME }}
+      AddHost=host.containers.internal:host-gateway
+      PublishPort={{ APPFLOWY_PUBLISH_CLOUD }}
+      PublishPort={{ APPFLOWY_PUBLISH_GOTRUE }}
+      PublishPort={{ APPFLOWY_PUBLISH_WEB }}
+      PublishPort={{ APPFLOWY_PUBLISH_ADMIN }}
+      PublishPort={{ APPFLOWY_PUBLISH_MINIO_API }}
+      PublishPort={{ APPFLOWY_PUBLISH_MINIO_CONSOLE }}
+      DNS={{ APPFLOWY_DNS_GATEWAY }}
+
+- name: "AppFlowy | Write quadlet: redis"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/appflowy-redis.container"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=redis
+      Image={{ APPFLOWY_IMG_REDIS }}
+      Pod={{ APPFLOWY_POD_NAME }}.pod
+
+- name: "AppFlowy | Write quadlet: minio"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/appflowy-minio.container"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0600"
+    content: |
+      [Container]
+      ContainerName=minio
+      Image={{ APPFLOWY_IMG_MINIO }}
+      Pod={{ APPFLOWY_POD_NAME }}.pod
+      Exec=server /data --console-address :9001
+      Environment=MINIO_ROOT_USER=minio
+      Environment=MINIO_ROOT_PASSWORD={{ MINIO_ROOT_PASSWORD }}
+      Volume=appflowy_minio_data:/data:Z
+
+- name: "AppFlowy | Write quadlet: gotrue"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/appflowy-gotrue.container"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=gotrue
+      Image={{ APPFLOWY_IMG_GOTRUE }}
+      Pod={{ APPFLOWY_POD_NAME }}.pod
+      EnvironmentFile={{ APPFLOWY_ENV_FILE_GOTRUE }}
+
+- name: "AppFlowy | Write quadlet: cloud"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/appflowy-cloud.container"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=appflowy_cloud
+      Image={{ APPFLOWY_IMG_CLOUD }}
+      Pod={{ APPFLOWY_POD_NAME }}.pod
+      EnvironmentFile={{ APPFLOWY_ENV_FILE_COMMON }}
+      Environment=RUST_LOG=info
+      Environment=APPFLOWY_GOTRUE_BASE_URL=http://gotrue:8081
+
+- name: "AppFlowy | Write quadlet: worker"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/appflowy-worker.container"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=appflowy_worker
+      Image={{ APPFLOWY_IMG_WORKER }}
+      Pod={{ APPFLOWY_POD_NAME }}.pod
+      EnvironmentFile={{ APPFLOWY_ENV_FILE_COMMON }}
+      Environment=APPFLOWY_GOTRUE_BASE_URL=http://gotrue:8081
+
+- name: "AppFlowy | Write quadlet: web"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/appflowy-web.container"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=appflowy_web
+      Image={{ APPFLOWY_IMG_WEB }}
+      Pod={{ APPFLOWY_POD_NAME }}.pod
+      EnvironmentFile={{ APPFLOWY_ENV_FILE_COMMON }}
+      Environment=PORT=3000
+      Environment=HOST=0.0.0.0
+
+- name: "AppFlowy | Write quadlet: admin frontend"
+  ansible.builtin.copy:
+    dest: "{{ APPFLOWY_QUADLET_DIR }}/appflowy-admin-frontend.container"
+    owner: "{{ APPFLOWY_USER }}"
+    group: "{{ APPFLOWY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=admin_frontend
+      Image={{ APPFLOWY_IMG_ADMIN }}
+      Pod={{ APPFLOWY_POD_NAME }}.pod
+      EnvironmentFile={{ APPFLOWY_ENV_FILE_COMMON }}
+      Environment=NEXT_TELEMETRY_DISABLED=1
+      Environment=PORT=3100
+      Environment=HOST=0.0.0.0
+
+
+- name: "AppFlowy | Postgres: allow Podman subnet in pg_hba.conf"
+  block:
+    - name: "AppFlowy | Postgres: discover pg_hba.conf path"
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: appflowy_hba_file
+      changed_when: false
+
+    - name: "AppFlowy | Postgres: allow podman subnet (appflowy -> appflowy) in pg_hba.conf"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ appflowy_hba_file.stdout | trim }}"
+        contype: host
+        databases: appflowy
+        users: appflowy
+        source: "{{ APPFLOWY_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+
+    - name: "AppFlowy | Postgres: allow podman subnet (postgres -> appflowy, auth schema) in pg_hba.conf"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ appflowy_hba_file.stdout | trim }}"
+        contype: host
+        databases: appflowy
+        users: postgres
+        source: "{{ APPFLOWY_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+
+    # INSERT THESE TWO TASKS HERE
+    - name: "AppFlowy | Postgres: allow samehost (appflowy -> appflowy)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ appflowy_hba_file.stdout | trim }}"
+        contype: host
+        databases: appflowy
+        users: appflowy
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "AppFlowy | Postgres: allow samehost (postgres -> appflowy)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ appflowy_hba_file.stdout | trim }}"
+        contype: host
+        databases: appflowy
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+    # END INSERT
+
+    - name: "AppFlowy | Postgres: reload config"
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "AppFlowy | Postgres: reload config"
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+- name: AppFlowy | Add log format for vhost
+  ansible.builtin.blockinfile:
+    path: /etc/nginx/conf.d/00-log-formats.conf
+    owner: root
+    group: root
+    mode: "0644"
+    create: true
+    marker: "# {mark} ANSIBLE APPFLOWY LOG FORMAT"
+    block: |
+      log_format appflowy '$remote_addr - $remote_user [$time_local] '
+                          '"$uri" $status $body_bytes_sent '
+                          '"$http_referer" "$http_user_agent"';
+
+                                
+- name: AppFlowy | Write nginx vhost (replaces placeholder)
+  block:
+    - name: AppFlowy | Remove old placeholder vhost if present
+      ansible.builtin.file:
+        path: "/etc/nginx/conf.d/{{ APPFLOWY_HOST }}.conf"
+        state: absent
+
+    - name: AppFlowy | Install vhost
+      ansible.builtin.copy:
+        dest: "/etc/nginx/conf.d/{{ APPFLOWY_HOST }}.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Redirect http to https
+          server {
+              listen {{ WG_SERVER_IP }}:80;
+              server_name {{ APPFLOWY_HOST }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen {{ WG_SERVER_IP }}:443 ssl;
+              http2 on;
+              server_name {{ APPFLOWY_HOST }};
+
+              include /etc/nginx/default.d/*.conf;
+              ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+              ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+              access_log /var/log/nginx/{{ APPFLOWY_HOST }}_access.log appflowy;
+              error_log  /var/log/nginx/{{ APPFLOWY_HOST }}_error.log warn;
+
+              client_max_body_size 10M;
+              underscores_in_headers on;
+
+              set $appflowy_cloud_backend   "http://127.0.0.1:8000";
+              set $gotrue_backend           "http://127.0.0.1:8081";
+              set $admin_frontend_backend   "http://127.0.0.1:3100";
+              set $appflowy_web_backend     "http://127.0.0.1:3000";
+              set $minio_api_backend        "http://127.0.0.1:9000";
+              set $minio_console_backend    "http://127.0.0.1:9001";
+              set $minio_internal_host      "127.0.0.1:9000";
+
+              location ^~ /gotrue/ {
+                  proxy_pass http://127.0.0.1:8081/;   # NOTE trailing slash
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Host $host;
+                  proxy_set_header X-Forwarded-Port $server_port;
+                  proxy_set_header X-Forwarded-Prefix /gotrue;
+                  proxy_set_header X-Request-Id $request_id;
+              }
+
+              location ^~ /ws/ {
+                  add_header X-Debug-Ws hit-ws always;
+                  proxy_pass http://127.0.0.1:8000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 86400s;
+                  proxy_send_timeout 86400s;
+                  proxy_buffering off;
+                  access_log /var/log/nginx/{{ APPFLOWY_HOST }}_ws.log appflowy;
+              }
+
+
+              location /api {
+                  proxy_pass $appflowy_cloud_backend;
+                  proxy_set_header X-Request-Id $request_id;
+                  proxy_set_header Host $http_host;
+              }
+
+              location /minio/ {
+                  proxy_pass $minio_console_backend;
+                  rewrite ^/minio/(.*) /$1 break;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+              }
+
+              location /minio-api/ {
+                  proxy_pass $minio_api_backend;
+                  proxy_set_header Host $minio_internal_host;
+                  rewrite ^/minio-api/(.*) /$1 break;
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  client_max_body_size 1000M;
+              }
+
+              location = /console {
+                  proxy_pass $admin_frontend_backend;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 86400s;
+              }
+
+              location ^~ /console/ {
+                  proxy_pass $admin_frontend_backend;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 86400s;
+              }
+
+              location / {
+                  proxy_pass $appflowy_web_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Scheme $scheme;
+              }
+          }
+
+    - name: AppFlowy | nginx config test
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: AppFlowy | Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
+- name: AppFlowy | Generate units + start (ordered)
+  block:
+    - name: AppFlowy | Reload systemd (pick up quadlets)
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user daemon-reload
+      changed_when: false
+
+    - name: AppFlowy | Start pod (infra + hostport rules)
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user restart {{ APPFLOWY_POD_NAME }}-pod.service
+      changed_when: false
+
+    - name: AppFlowy | Start redis + minio
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user start {{ item }}
+      loop:
+        - appflowy-redis.service
+        - appflowy-minio.service
+      changed_when: false
+
+    - name: AppFlowy | Wait for redis + minio to be active
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user is-active {{ item }}
+      register: appflowy_unit_active
+      changed_when: false
+      retries: 30
+      delay: 1
+      until: appflowy_unit_active.stdout.strip() == "active"
+      loop:
+        - appflowy-redis.service
+        - appflowy-minio.service
+
+    - name: AppFlowy | Start gotrue
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user restart appflowy-gotrue.service
+      changed_when: false
+
+    - name: AppFlowy | Wait for GoTrue auth.users to exist in appflowy DB
+      community.postgresql.postgresql_query:
+        login_db: appflowy
+        login_host: 127.0.0.1
+        login_user: postgres
+        login_password: "{{ PGPASSWORD }}"
+        query: "SELECT to_regclass('auth.users') IS NOT NULL AS ok;"
+      register: appflowy_auth_ready
+      retries: 120
+      delay: 1
+      until: appflowy_auth_ready.query_result[0].ok
+      changed_when: false
+
+    - name: AppFlowy | Start appflowy-cloud (runs migrations)
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user restart appflowy-cloud.service
+      changed_when: false
+
+    - name: AppFlowy | Start remaining services
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }}
+        env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }}
+        DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }}
+        systemctl --user restart {{ item }}
+      loop:
+        - appflowy-worker.service
+        - appflowy-web.service
+        - appflowy-admin-frontend.service
+      changed_when: false
+  become: true
+
+- name: "AppFlowy | Postgres: grant appflowy read access to auth schema/tables"
+  block:
+    - name: "AppFlowy | Postgres: grant USAGE on schema auth to appflowy"
+      community.postgresql.postgresql_privs:
+        login_db: appflowy
+        login_host: 127.0.0.1
+        login_user: postgres
+        login_password: "{{ PGPASSWORD }}"
+        type: schema
+        objs: auth
+        roles: appflowy
+        privs: USAGE
+        state: present
+
+    - name: "AppFlowy | Postgres: grant SELECT on all auth tables to appflowy"
+      community.postgresql.postgresql_privs:
+        login_db: appflowy
+        login_host: 127.0.0.1
+        login_user: postgres
+        login_password: "{{ PGPASSWORD }}"
+        type: table
+        schema: auth
+        objs: ALL_IN_SCHEMA
+        roles: appflowy
+        privs: SELECT
+        state: present
+
+    - name: "AppFlowy | Postgres: ensure default SELECT on future auth tables for appflowy"
+      community.postgresql.postgresql_query:
+        login_db: appflowy
+        login_host: 127.0.0.1
+        login_user: postgres
+        login_password: "{{ PGPASSWORD }}"
+        query: "ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT SELECT ON TABLES TO appflowy;"
+  become: true
+
+
+- name: "AppFlowy | UFW: allow web + ensure forwarding (idempotent-ish)"
+  block:
+    - name: AppFlowy | Ensure DEFAULT_FORWARD_POLICY=ACCEPT
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+
+    - name: AppFlowy | Allow DNS to podman network gateway (route allow)
+      ansible.builtin.command: >-
+        ufw route allow in on {{ APPFLOWY_PODMAN_IFACE }} out on {{ APPFLOWY_PODMAN_IFACE }}
+        to {{ APPFLOWY_DNS_GATEWAY }} port 53 proto {{ item }}
+      loop:
+        - udp
+        - tcp
+      register: appflowy_ufw_route_dns
+      changed_when: false
+      failed_when: false
+
+    - name: AppFlowy | Allow DNS to podman network gateway (inbound allow)
+      ansible.builtin.command: >-
+        ufw allow in on {{ APPFLOWY_PODMAN_IFACE }}
+        to {{ APPFLOWY_DNS_GATEWAY }} port 53 proto {{ item }}
+      loop:
+        - udp
+        - tcp
+      register: appflowy_ufw_in_dns
+      changed_when: false
+      failed_when: false
+
+    - name: AppFlowy | Reload ufw
+      ansible.builtin.command: ufw reload
+      changed_when: false
+      failed_when: false
+
+- name: "SELinux: allow nginx to connect to upstream services"
+  block:
+    - name: Check SELinux mode
+      ansible.builtin.command: getenforce
+      register: selinux_mode
+      changed_when: false
+      failed_when: false
+
+    - name: Enable httpd_can_network_connect (needed for nginx reverse proxy)
+      ansible.builtin.command: setsebool -P httpd_can_network_connect on
+      when: selinux_mode.stdout is defined and selinux_mode.stdout == "Enforcing"
+      register: setsebool_result
+      changed_when: setsebool_result.rc == 0
+      failed_when: false
+
+- name: "AppFlowy | Save key vars for debugging (/etc/profile.d/system_vars.sh)"
+  ansible.builtin.copy:
+    dest: /etc/profile.d/system_vars.sh
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      export DOMAIN='{{ DOMAIN }}'
+      export APPFLOWY_NET_NAME='{{ APPFLOWY_NET_NAME }}'
+      export APPFLOWY_ROOT='{{ APPFLOWY_ROOT }}'
+      export APPFLOWY_HOST='{{ APPFLOWY_HOST }}'
+      export APPFLOWY_PODMAN_IFACE='{{ APPFLOWY_PODMAN_IFACE }}'
+      export APPFLOWY_PODMAN_SUBNET='{{ APPFLOWY_PODMAN_SUBNET }}'
+      export APPFLOWY_ENV_FILE='{{ APPFLOWY_ENV_FILE }}'
+      export APPFLOWY_DNS_GATEWAY='{{ APPFLOWY_DNS_GATEWAY }}'
+
+- name: AppFlowy | Quick sanity checks (non-fatal)
+  block:
+    - name: AppFlowy | Show units status (key ones)
+      become: true
+    
+      ansible.builtin.command: >-
+        sudo -u {{ APPFLOWY_USER }} env XDG_RUNTIME_DIR={{ APPFLOWY_XDG_RUNTIME_DIR }} DBUS_SESSION_BUS_ADDRESS={{ APPFLOWY_DBUS_SESSION_BUS_ADDRESS }} systemctl --user --no-pager --full status
+        {{ APPFLOWY_POD_NAME }}-pod.service
+        appflowy-gotrue.service
+        appflowy-cloud.service
+        appflowy-worker.service
+        appflowy-web.service
+        appflowy-admin-frontend.service
+        # appflowy-admin-frontend-bridge.service
+        nginx.service
+      changed_when: false
+      failed_when: false
+
+    - name: AppFlowy | Show podman ps
+      ansible.builtin.command: "sudo -u {{ APPFLOWY_USER }} podman ps --format 'table {{'{{'}}.Names{{'}}'}}\t{{'{{'}}.Status{{'}}'}}\t{{'{{'}}.Pods{{'}}'}}\t{{'{{'}}.Ports{{'}}'}}'"
+      args:
+        chdir: "/home/{{ APPFLOWY_USER }}"
+      environment:
+        HOME: "/home/{{ APPFLOWY_USER }}"
+      changed_when: false
+      failed_when: false
+
+    - name: AppFlowy | Show host listeners (nginx + loopback backends)
+      ansible.builtin.shell: "ss -lntp | grep -E ':(80|443|8000|8081|3000|3100|9000|9001)\\b' || true"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false

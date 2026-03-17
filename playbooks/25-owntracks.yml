@@ -1,0 +1,398 @@
+---
+- name: "OwnTracks | Set derived vars / defaults"
+  ansible.builtin.set_fact:
+    OWNTRACKS_USER: "{{ OWNTRACKS_USER | default('owntracks') }}"
+    OWNTRACKS_POD_NAME: "{{ OWNTRACKS_POD_NAME | default('owntracks') }}"
+
+    OWNTRACKS_ROOT: "{{ OWNTRACKS_ROOT | default('/opt/owntracks') }}"
+    OWNTRACKS_ENV_DIR: "{{ OWNTRACKS_ENV_DIR | default('/etc/owntracks') }}"
+
+    OWNTRACKS_HOST: "{{ OWNTRACKS_HOST | default('owntracks.' ~ DOMAIN) }}"
+
+    OWNTRACKS_RECORDER_IMAGE: "{{ OWNTRACKS_RECORDER_IMAGE | default('docker.io/owntracks/recorder:latest') }}"
+    OWNTRACKS_FRONTEND_IMAGE: "{{ OWNTRACKS_FRONTEND_IMAGE | default('docker.io/owntracks/frontend:latest') }}"
+    OWNTRACKS_MOSQUITTO_IMAGE: "{{ OWNTRACKS_MOSQUITTO_IMAGE | default('docker.io/eclipse-mosquitto:2') }}"
+
+    OWNTRACKS_RECORDER_PORT: "{{ (OWNTRACKS_RECORDER_PORT | default(8083)) | int }}"
+    OWNTRACKS_FRONTEND_PORT: "{{ (OWNTRACKS_FRONTEND_PORT | default(8085)) | int }}"
+    OWNTRACKS_MQTT_TLS_PORT: "{{ (OWNTRACKS_MQTT_TLS_PORT | default(8883)) | int }}"
+    OWNTRACKS_MQTT_INTERNAL_PORT: "{{ (OWNTRACKS_MQTT_INTERNAL_PORT | default(1883)) | int }}"
+
+- name: "OwnTracks | More derived vars"
+  ansible.builtin.set_fact:
+    OWNTRACKS_MQTT_HOST: "{{ OWNTRACKS_MQTT_HOST | default(OWNTRACKS_HOST) }}"
+    OWNTRACKS_STORE_DIR: "{{ OWNTRACKS_STORE_DIR | default(OWNTRACKS_ROOT ~ '/store') }}"
+    OWNTRACKS_CONFIG_DIR: "{{ OWNTRACKS_CONFIG_DIR | default(OWNTRACKS_ROOT ~ '/config') }}"
+    OWNTRACKS_FRONTEND_CONFIG_DIR: "{{ OWNTRACKS_FRONTEND_CONFIG_DIR | default(OWNTRACKS_ROOT ~ '/frontend-config') }}"
+    OWNTRACKS_QUADLET_DIR: "{{ OWNTRACKS_QUADLET_DIR | default('/home/' ~ OWNTRACKS_USER ~ '/.config/containers/systemd') }}"
+
+- name: "OwnTracks | More derived vars part 2"
+  ansible.builtin.set_fact:
+    OWNTRACKS_FRONTEND_CONFIG_JS: "{{ OWNTRACKS_FRONTEND_CONFIG_JS | default(OWNTRACKS_FRONTEND_CONFIG_DIR ~ '/config.js') }}"
+    OWNTRACKS_MOSQUITTO_CONFIG_FILE: "{{ OWNTRACKS_MOSQUITTO_CONFIG_FILE | default(OWNTRACKS_CONFIG_DIR ~ '/mosquitto.conf') }}"
+    OWNTRACKS_MOSQUITTO_ACL_FILE: "{{ OWNTRACKS_MOSQUITTO_ACL_FILE | default(OWNTRACKS_CONFIG_DIR ~ '/acl') }}"
+    OWNTRACKS_MOSQUITTO_PASSWD_FILE: "{{ OWNTRACKS_MOSQUITTO_PASSWD_FILE | default(OWNTRACKS_CONFIG_DIR ~ '/passwd') }}"
+    OWNTRACKS_TLS_CERT_FILE: "{{ OWNTRACKS_TLS_CERT_FILE | default(OWNTRACKS_CONFIG_DIR ~ '/wildcard.crt') }}"
+    OWNTRACKS_TLS_KEY_FILE: "{{ OWNTRACKS_TLS_KEY_FILE | default(OWNTRACKS_CONFIG_DIR ~ '/wildcard.key') }}"
+
+- name: "OwnTracks | Preflight: ensure required vars exist"
+  ansible.builtin.assert:
+    that:
+      - DOMAIN is defined
+      - WG_SERVER_IP is defined
+      - OWNTRACKS_APP_USERNAME is defined
+      - OWNTRACKS_APP_PASSWORD is defined
+      - OWNTRACKS_RECORDER_MQTT_USERNAME is defined
+      - OWNTRACKS_RECORDER_MQTT_PASSWORD is defined
+    fail_msg: >-
+      Missing required vars. Ensure DOMAIN, WG_SERVER_IP,
+      OWNTRACKS_APP_USERNAME, OWNTRACKS_APP_PASSWORD,
+      OWNTRACKS_RECORDER_MQTT_USERNAME, and
+      OWNTRACKS_RECORDER_MQTT_PASSWORD are present.
+
+- name: "Podman | Install rootless networking helper and mosquitto_passwd utility"
+  become: true
+  ansible.builtin.dnf:
+    name:
+      - slirp4netns
+      - mosquitto
+    state: present
+
+- name: "OwnTracks | Ensure directories exist"
+  become: true
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ OWNTRACKS_ROOT }}",                owner: "root",                 group: "root",                  mode: "0755" }
+    - { path: "{{ OWNTRACKS_STORE_DIR }}",           owner: "{{ OWNTRACKS_USER }}", group: "{{ OWNTRACKS_USER }}", mode: "0750" }
+    - { path: "{{ OWNTRACKS_CONFIG_DIR }}",          owner: "{{ OWNTRACKS_USER }}", group: "{{ OWNTRACKS_USER }}", mode: "0750" }
+    - { path: "{{ OWNTRACKS_FRONTEND_CONFIG_DIR }}", owner: "{{ OWNTRACKS_USER }}", group: "{{ OWNTRACKS_USER }}", mode: "0750" }
+    - { path: "{{ OWNTRACKS_ENV_DIR }}",             owner: "root",                 group: "{{ OWNTRACKS_USER }}", mode: "0750" }
+    - { path: "{{ OWNTRACKS_QUADLET_DIR }}",         owner: "{{ OWNTRACKS_USER }}", group: "{{ OWNTRACKS_USER }}", mode: "0750" }
+
+- name: "OwnTracks | Copy MQTT TLS certificate for container use"
+  become: true
+  ansible.builtin.copy:
+    src: "/etc/pki/nginx/{{ DOMAIN }}/wildcard.crt"
+    remote_src: true
+    dest: "{{ OWNTRACKS_TLS_CERT_FILE }}"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+
+- name: "OwnTracks | Copy MQTT TLS key for container use"
+  become: true
+  ansible.builtin.copy:
+    src: "/etc/pki/nginx/{{ DOMAIN }}/wildcard.key"
+    remote_src: true
+    dest: "{{ OWNTRACKS_TLS_KEY_FILE }}"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+
+- name: "OwnTracks | Install frontend config.js"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OWNTRACKS_FRONTEND_CONFIG_JS }}"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+    content: |
+      // Managed by Ansible
+      window.owntracks = window.owntracks || {};
+      window.owntracks.config = {
+          api: {
+              baseUrl: "https://{{ OWNTRACKS_HOST }}/owntracks/",
+          },
+          map: {
+              url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+              options: {
+                  attribution: "&copy; OpenStreetMap contributors",
+                  maxZoom: 19
+              }
+          }
+      };
+  
+- name: "OwnTracks | Install mosquitto ACL"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OWNTRACKS_MOSQUITTO_ACL_FILE }}"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+    content: |
+      user {{ OWNTRACKS_RECORDER_MQTT_USERNAME }}
+      topic read owntracks/#
+
+      user {{ OWNTRACKS_APP_USERNAME }}
+      topic write owntracks/{{ OWNTRACKS_APP_USERNAME }}/#
+      topic read owntracks/+/+
+      topic read owntracks/+/+/event
+      topic read owntracks/+/+/info
+      topic read owntracks/{{ OWNTRACKS_APP_USERNAME }}/+/cmd
+
+- name: "OwnTracks | Ensure mosquitto password file exists"
+  become: true
+  ansible.builtin.file:
+    path: "{{ OWNTRACKS_MOSQUITTO_PASSWD_FILE }}"
+    state: touch
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+
+- name: "OwnTracks | Set app MQTT password"
+  become: true
+  ansible.builtin.command:
+    argv:
+      - mosquitto_passwd
+      - -b
+      - "{{ OWNTRACKS_MOSQUITTO_PASSWD_FILE }}"
+      - "{{ OWNTRACKS_APP_USERNAME }}"
+      - "{{ OWNTRACKS_APP_PASSWORD }}"
+  no_log: true
+  changed_when: true
+
+- name: "OwnTracks | Set recorder MQTT password"
+  become: true
+  ansible.builtin.command:
+    argv:
+      - mosquitto_passwd
+      - -b
+      - "{{ OWNTRACKS_MOSQUITTO_PASSWD_FILE }}"
+      - "{{ OWNTRACKS_RECORDER_MQTT_USERNAME }}"
+      - "{{ OWNTRACKS_RECORDER_MQTT_PASSWORD }}"
+  no_log: true
+  changed_when: true
+
+- name: "OwnTracks | Re-assert ownership of mosquitto password file"
+  become: true
+  ansible.builtin.file:
+    path: "{{ OWNTRACKS_MOSQUITTO_PASSWD_FILE }}"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+
+- name: "OwnTracks | Install mosquitto.conf"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OWNTRACKS_MOSQUITTO_CONFIG_FILE }}"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+    content: |
+      persistence false
+      log_dest stdout
+      per_listener_settings false
+      allow_anonymous false
+      password_file /mosquitto/config/passwd
+      acl_file /mosquitto/config/acl
+
+      listener {{ OWNTRACKS_MQTT_INTERNAL_PORT }} 0.0.0.0
+      protocol mqtt
+
+      listener 8883 0.0.0.0
+      protocol mqtt
+      certfile /mosquitto/config/wildcard.crt
+      keyfile /mosquitto/config/wildcard.key
+      require_certificate false
+
+- name: "OwnTracks | UFW allow MQTT TLS from WireGuard subnet"
+  become: true
+  community.general.ufw:
+      rule: allow
+      proto: tcp
+      src: "{{ WG_SUBNET_CIDR }}"
+      to_ip: "{{ WG_SERVER_IP }}"
+      port: "{{ OWNTRACKS_MQTT_TLS_PORT }}"
+
+- name: "OwnTracks | Get UID of service user"
+  ansible.builtin.command: "id -u {{ OWNTRACKS_USER }}"
+  register: owntracks_uid
+  changed_when: false
+
+- name: "OwnTracks | Set XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS"
+  ansible.builtin.set_fact:
+    OWNTRACKS_XDG_RUNTIME_DIR: "/run/user/{{ owntracks_uid.stdout | trim }}"
+    OWNTRACKS_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ owntracks_uid.stdout | trim }}/bus"
+
+- name: "OwnTracks | Install pod quadlet"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OWNTRACKS_QUADLET_DIR }}/{{ OWNTRACKS_POD_NAME }}.pod"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+    content: |
+      [Pod]
+      PodName={{ OWNTRACKS_POD_NAME }}.pod
+      Network=slirp4netns:allow_host_loopback=true
+      PublishPort=127.0.0.1:{{ OWNTRACKS_RECORDER_PORT }}:8083
+      PublishPort=127.0.0.1:{{ OWNTRACKS_FRONTEND_PORT }}:80
+      PublishPort={{ WG_SERVER_IP }}:{{ OWNTRACKS_MQTT_TLS_PORT }}:8883
+
+- name: "OwnTracks | Install mosquitto quadlet"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OWNTRACKS_QUADLET_DIR }}/{{ OWNTRACKS_POD_NAME }}-mosquitto.container"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=OwnTracks Mosquitto
+
+      [Container]
+      ContainerName=owntracks_mosquitto
+      Image={{ OWNTRACKS_MOSQUITTO_IMAGE }}
+      Pod={{ OWNTRACKS_POD_NAME }}.pod
+      Volume={{ OWNTRACKS_MOSQUITTO_CONFIG_FILE }}:/mosquitto/config/mosquitto.conf:ro,Z
+      Volume={{ OWNTRACKS_MOSQUITTO_ACL_FILE }}:/mosquitto/config/acl:ro,Z
+      Volume={{ OWNTRACKS_MOSQUITTO_PASSWD_FILE }}:/mosquitto/config/passwd:ro,Z
+      Volume={{ OWNTRACKS_TLS_CERT_FILE }}:/mosquitto/config/wildcard.crt:ro,Z
+      Volume={{ OWNTRACKS_TLS_KEY_FILE }}:/mosquitto/config/wildcard.key:ro,Z
+
+- name: "OwnTracks | Install recorder quadlet"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OWNTRACKS_QUADLET_DIR }}/{{ OWNTRACKS_POD_NAME }}-recorder.container"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=OwnTracks Recorder
+      After={{ OWNTRACKS_POD_NAME }}-mosquitto.service
+      Requires={{ OWNTRACKS_POD_NAME }}-mosquitto.service
+
+      [Container]
+      ContainerName=otrecorder
+      Image={{ OWNTRACKS_RECORDER_IMAGE }}
+      Pod={{ OWNTRACKS_POD_NAME }}.pod
+      Volume={{ OWNTRACKS_STORE_DIR }}:/store:Z
+      Environment=OTR_HOST=127.0.0.1
+      Environment=OTR_PORT={{ OWNTRACKS_MQTT_INTERNAL_PORT }}
+      Environment=OTR_USER={{ OWNTRACKS_RECORDER_MQTT_USERNAME }}
+      Environment=OTR_PASS={{ OWNTRACKS_RECORDER_MQTT_PASSWORD }}
+      Environment=OTR_TOPICS=owntracks/#
+
+- name: "OwnTracks | Install frontend quadlet"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OWNTRACKS_QUADLET_DIR }}/{{ OWNTRACKS_POD_NAME }}-frontend.container"
+    owner: "{{ OWNTRACKS_USER }}"
+    group: "{{ OWNTRACKS_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=OwnTracks Frontend
+
+      [Container]
+      ContainerName=owntracks_frontend
+      Image={{ OWNTRACKS_FRONTEND_IMAGE }}
+      Pod={{ OWNTRACKS_POD_NAME }}.pod
+      Environment=SERVER_HOST=127.0.0.1
+      Environment=SERVER_PORT=8083
+      Volume={{ OWNTRACKS_FRONTEND_CONFIG_JS }}:/usr/share/nginx/html/config/config.js:ro,Z
+
+- name: "OwnTracks | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ OWNTRACKS_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ OWNTRACKS_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ OWNTRACKS_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+- name: "OwnTracks | Restart pod service"
+  become: true
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --machine={{ OWNTRACKS_USER }}@.host --user restart
+      {{ OWNTRACKS_POD_NAME }}-pod.service
+  changed_when: false
+
+- name: "OwnTracks | Install nginx vhost"
+  become: true
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ OWNTRACKS_HOST }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ OWNTRACKS_HOST }};
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen {{ WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ OWNTRACKS_HOST }};
+
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log /var/log/nginx/{{ OWNTRACKS_HOST }}_access.log main;
+          error_log  /var/log/nginx/{{ OWNTRACKS_HOST }}_error.log warn;
+
+          location /owntracks/ws {
+              rewrite ^/owntracks/(.*) /$1 break;
+              proxy_pass http://127.0.0.1:{{ OWNTRACKS_RECORDER_PORT }};
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          location /owntracks/view/ {
+              proxy_pass http://127.0.0.1:{{ OWNTRACKS_RECORDER_PORT }}/view/;
+              include /etc/nginx/proxy_params;
+          }
+
+          location /owntracks/static/ {
+              proxy_pass http://127.0.0.1:{{ OWNTRACKS_RECORDER_PORT }}/static/;
+              include /etc/nginx/proxy_params;
+          }
+
+          location /owntracks/utils/ {
+              proxy_pass http://127.0.0.1:{{ OWNTRACKS_RECORDER_PORT }}/utils/;
+              include /etc/nginx/proxy_params;
+          }
+
+          location /owntracks/ {
+              proxy_pass http://127.0.0.1:{{ OWNTRACKS_RECORDER_PORT }}/;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          location / {
+              proxy_pass http://127.0.0.1:{{ OWNTRACKS_FRONTEND_PORT }};
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+      }
+
+- name: "OwnTracks | nginx config test"
+  become: true
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: "OwnTracks | Restart nginx"
+  become: true
+  ansible.builtin.systemd:
+    name: nginx
+    state: restarted

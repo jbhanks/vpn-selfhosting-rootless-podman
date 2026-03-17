@@ -1,0 +1,58 @@
+- name: "Ensure {{ sshuser }} .ssh exists"
+  ansible.builtin.file:
+    path: "/home/{{ sshuser }}/.ssh"
+    state: directory
+    owner: "{{ sshuser }}"
+    group: "{{ sshuser }}"
+    mode: "0700"
+
+- name: "Copy root authorized_keys to {{ sshuser }}"
+  ansible.builtin.copy:
+    remote_src: true
+    src: /root/.ssh/authorized_keys
+    dest: "/home/{{ sshuser }}/.ssh/authorized_keys"
+    owner: "{{ sshuser }}"
+    group: "{{ sshuser }}"
+    mode: "0600"
+
+- name: "Copy outbound Git SSH key files to {{ sshuser }}"
+  ansible.builtin.copy:
+    src: "{{ ssh_file.src }}"
+    dest: "{{ ssh_file.dest }}"
+    owner: "{{ sshuser }}"
+    group: "{{ sshuser }}"
+    mode: "{{ ssh_file.mode }}"
+    remote_src: true
+  loop:
+    - src: "/etc/ssh/client_keys/ed25519_{{ DOMAIN }}"
+      dest: "/home/{{ sshuser }}/.ssh/ed25519_{{ DOMAIN }}"
+      mode: "0600"
+    - src: "/etc/ssh/client_keys/ed25519_{{ DOMAIN }}.pub"
+      dest: "/home/{{ sshuser }}/.ssh/ed25519_{{ DOMAIN }}.pub"
+      mode: "0644"
+  loop_control:
+    loop_var: ssh_file
+
+- name: "Seed {{ sshuser }} SSH config to use copied Gitea key"
+  ansible.builtin.copy:
+    dest: "/home/{{ sshuser }}/.ssh/config"
+    owner: "{{ sshuser }}"
+    group: "{{ sshuser }}"
+    mode: "0600"
+    content: |
+      Host {{ GITEAHOST }}
+          HostName {{ GITEAHOST }}
+          IdentityFile ~/.ssh/ed25519_{{ DOMAIN }}
+          IdentitiesOnly yes
+          User git
+          Port {{ GITSSHPORT }}
+
+- name: "Create {{ sshuser }} askpass.sh with Git SSH passphrase"
+  ansible.builtin.copy:
+    dest: "/home/{{ sshuser }}/.ssh/askpass.sh"
+    owner: "{{ sshuser }}"
+    group: "{{ sshuser }}"
+    mode: "0700"
+    content: |
+      #!/bin/sh
+      echo "{{ GITSSHPHRASE }}"

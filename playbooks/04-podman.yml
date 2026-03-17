@@ -1,0 +1,61 @@
+---
+- name: Install podman
+  ansible.builtin.package:
+    name: podman
+    state: present
+
+- name: "Postgres | Allow Podman subnet to reach DBPORT (pg_hba + UFW)"
+  block:
+    - name: "Podman | Inspect default network (JSON)"
+      ansible.builtin.command: podman network inspect podman
+      register: podman_default_net
+      changed_when: false
+
+    - name: "Podman | Parse subnet + interface"
+      ansible.builtin.set_fact:
+        PODMAN_DEFAULT_NET_JSON: "{{ podman_default_net.stdout | from_json }}"
+        PODMAN_DEFAULT_SUBNET: "{{ (podman_default_net.stdout | from_json)[0].subnets[0].subnet }}"
+        PODMAN_DEFAULT_IFACE: "{{ (podman_default_net.stdout | from_json)[0].network_interface }}"
+
+    - name: "Postgres | Discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: postgres_hba_file
+      changed_when: false
+
+    - name: "Postgres | Allow Podman subnet in pg_hba.conf (containers -> postgres)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ postgres_hba_file.stdout | trim }}"
+        contype: host
+        databases: all
+        users: all
+        source: "{{ PODMAN_DEFAULT_SUBNET }}"
+        method: scram-sha-256
+        state: present
+
+    - name: "Postgres | Reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "UFW | Allow DBPORT from Podman subnet on Podman interface"
+      community.general.ufw:
+        rule: allow
+        interface_in: "{{ PODMAN_DEFAULT_IFACE }}"
+        from_ip: "{{ PODMAN_DEFAULT_SUBNET }}"
+        port: "{{ DBPORT }}"
+        proto: tcp
+
+- name: Ensure quadlet directory exists
+  ansible.builtin.file:
+    path: /etc/containers/systemd
+    state: directory
+    mode: "0755"

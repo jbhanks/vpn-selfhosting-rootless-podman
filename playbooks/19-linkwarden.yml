@@ -1,0 +1,351 @@
+---
+- name: Linkwarden | Set derived vars and defaults
+  ansible.builtin.set_fact:
+    LINKWARDEN_USER: "{{ LINKWARDEN_USER | default('linkwarden') }}"
+    LINKWARDEN_POD_NAME: "{{ LINKWARDEN_POD_NAME | default('linkwarden') }}"
+    LINKWARDEN_IMAGE: "{{ LINKWARDEN_IMAGE | default('ghcr.io/linkwarden/linkwarden:latest') }}"
+    LINKWARDEN_ROOT: "{{ LINKWARDEN_ROOT | default('/opt/linkwarden') }}"
+    LINKWARDEN_DATA_DIR: "{{ LINKWARDEN_DATA_DIR | default(LINKWARDEN_ROOT ~ '/data') }}"
+    LINKWARDEN_MEILI_DIR: "{{ LINKWARDEN_MEILI_DIR | default(LINKWARDEN_ROOT ~ '/meili_data') }}"
+
+    LINKWARDEN_ENV_DIR: "{{ LINKWARDEN_ENV_DIR | default('/etc/linkwarden') }}"
+
+    LINKWARDEN_PORT: "{{ (LINKWARDEN_PORT | default(3000)) | int }}"
+    LINKWARDEN_FQDN: "{{ LINKWARDEN_FQDN | default('linkwarden.' ~ DOMAIN) }}"
+    
+    # Postgres (host)
+    LINKWARDEN_DB_NAME: "{{ LINKWARDEN_DB_NAME | default('linkwarden') }}"
+    LINKWARDEN_DB_USER: "{{ LINKWARDEN_DB_USER | default('linkwarden') }}"
+    LINKWARDEN_DB_HOST: "{{ LINKWARDEN_DB_HOST | default('127.0.0.1') }}"
+    LINKWARDEN_DB_PORT: "{{ LINKWARDEN_DB_PORT | default(DBPORT) }}"
+    LINKWARDEN_MEILI_HOST: "{{ LINKWARDEN_MEILI_HOST | default('http://127.0.0.1:7700') }}"
+
+    # Derived application URLs
+    LINKWARDEN_BASE_URL: "{{ LINKWARDEN_BASE_URL | default('https://linkwarden.' ~ DOMAIN) }}"
+    
+
+
+
+- name: Linkwarden | Derive database URL and other variables that depenbd on the above.
+  ansible.builtin.set_fact:
+    LINKWARDEN_ENV_FILE: "{{ LINKWARDEN_ENV_FILE | default(LINKWARDEN_ENV_DIR ~ '/linkwarden.env') }}"
+    LINKWARDEN_QUADLET_DIR: "{{ LINKWARDEN_QUADLET_DIR | default('/home/' ~ LINKWARDEN_USER ~ '/.config/containers/systemd') }}"
+    LINKWARDEN_NEXTAUTH_URL: "{{ LINKWARDEN_NEXTAUTH_URL | default(LINKWARDEN_BASE_URL ~ '/api/v1/auth') }}"
+    LINKWARDEN_DATABASE_URL: >-
+      {{ LINKWARDEN_DATABASE_URL
+         | default('postgresql://' ~ LINKWARDEN_DB_USER ~ ':' ~ LINKWARDEN_DB_PASSWORD ~ '@'
+                   ~ 'host.containers.internal' ~ ':' ~ (LINKWARDEN_DB_PORT | string) ~ '/' ~ LINKWARDEN_DB_NAME) }}
+
+- name: Linkwarden | Assert required secrets exist
+  ansible.builtin.assert:
+    that:
+      - LINKWARDEN_DB_PASSWORD is defined
+      - LINKWARDEN_NEXTAUTH_SECRET is defined
+      - LINKWARDEN_MEILI_MASTER_KEY is defined
+    fail_msg: >-
+      Missing one of required vars: LINKWARDEN_DB_PASSWORD, LINKWARDEN_NEXTAUTH_SECRET, LINKWARDEN_MEILI_MASTER_KEY
+
+- name: Linkwarden | Ensure service user exists
+  ansible.builtin.user:
+    name: "{{ LINKWARDEN_USER }}"
+    system: true
+    create_home: true
+    shell: /sbin/nologin
+
+
+- name: Linkwarden | Ensure env directory exists
+  ansible.builtin.file:
+    path: "{{ LINKWARDEN_ENV_DIR }}"
+    state: directory
+    owner: root
+    group: "{{ LINKWARDEN_USER }}"
+    mode: "0750"
+  become: true
+
+- name: Linkwarden | Ensure directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ LINKWARDEN_ROOT }}",       owner: "root",            group: "root",            mode: "0755" }
+    - { path: "{{ LINKWARDEN_DATA_DIR }}",  owner: "{{ LINKWARDEN_USER }}", group: "{{ LINKWARDEN_USER }}", mode: "0750" }
+    - { path: "{{ LINKWARDEN_MEILI_DIR }}", owner: "{{ LINKWARDEN_USER }}", group: "{{ LINKWARDEN_USER }}", mode: "0750" }
+    - { path: "{{ LINKWARDEN_ENV_DIR }}",   owner: "root",            group: "{{ LINKWARDEN_USER }}",            mode: "0750" }
+    - { path: "{{ LINKWARDEN_QUADLET_DIR }}", owner: "{{ LINKWARDEN_USER }}", group: "{{ LINKWARDEN_USER }}", mode: "0750" }
+
+# - name: Linkwarden | Ensure lingering enabled for service user
+#   ansible.builtin.command: "loginctl enable-linger {{ LINKWARDEN_USER }}"
+#   changed_when: false
+
+- name: Podman | Install rootless networking helper
+  become: true
+  ansible.builtin.dnf:
+    name:
+      - slirp4netns
+    state: present
+
+#####################################################################
+# Postgres
+#####################################################################
+
+- name: "Linkwarden | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "Linkwarden | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: linkwarden_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "Linkwarden | Postgres: allow podman subnet (linkwarden -> linkwarden)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ linkwarden_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ LINKWARDEN_DB_NAME }}"
+        users: "{{ LINKWARDEN_DB_USER }}"
+        source: "{{ LINKWARDEN_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: LINKWARDEN_PODMAN_SUBNET is defined
+
+    - name: "Linkwarden | Postgres: allow podman subnet (postgres -> linkwarden db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ linkwarden_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ LINKWARDEN_DB_NAME }}"
+        users: postgres
+        source: "{{ LINKWARDEN_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: LINKWARDEN_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "Linkwarden | Postgres: allow samehost (linkwarden -> linkwarden)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ linkwarden_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ LINKWARDEN_DB_NAME }}"
+        users: "{{ LINKWARDEN_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Linkwarden | Postgres: allow samehost (postgres -> linkwarden db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ linkwarden_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ LINKWARDEN_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Linkwarden | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "Linkwarden | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ LINKWARDEN_DB_USER }}"
+        password: "{{ LINKWARDEN_DB_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "Linkwarden | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ LINKWARDEN_DB_NAME }}"
+        owner: "{{ LINKWARDEN_DB_USER }}"
+        state: present
+
+
+#####################################################################
+# Env file for containers
+#####################################################################
+
+- name: Linkwarden | Write environment file
+  ansible.builtin.copy:
+    dest: "{{ LINKWARDEN_ENV_FILE }}"
+    owner: root
+    group: "{{ LINKWARDEN_USER }}"
+    mode: "0640"
+    content: |
+      NEXTAUTH_URL={{ LINKWARDEN_NEXTAUTH_URL }}
+      NEXTAUTH_SECRET={{ LINKWARDEN_NEXTAUTH_SECRET }}
+
+      DATABASE_URL={{ LINKWARDEN_DATABASE_URL }}
+
+      MEILI_HOST={{ LINKWARDEN_MEILI_HOST }}
+      MEILI_MASTER_KEY={{ LINKWARDEN_MEILI_MASTER_KEY }}
+
+      # Optional
+      # BASE_URL={{ LINKWARDEN_BASE_URL }}
+      NEXT_PUBLIC_DISABLE_REGISTRATION=false
+
+#####################################################################
+# Quadlets (pod + two containers)
+#####################################################################
+
+- name: Linkwarden | Install pod quadlet
+  ansible.builtin.copy:
+    dest: "{{ LINKWARDEN_QUADLET_DIR }}/{{ LINKWARDEN_POD_NAME }}.pod"
+    owner: "{{ LINKWARDEN_USER }}"
+    group: "{{ LINKWARDEN_USER }}"
+    mode: "0644"
+    content: |
+      [Pod]
+      PodName={{ LINKWARDEN_POD_NAME }}.pod
+      Network=slirp4netns:allow_host_loopback=true
+      PublishPort=127.0.0.1:{{ LINKWARDEN_PORT }}:3000
+
+- name: Linkwarden | Install meilisearch quadlet
+  ansible.builtin.copy:
+    dest: "{{ LINKWARDEN_QUADLET_DIR }}/{{ LINKWARDEN_POD_NAME }}-meili.container"
+    owner: "{{ LINKWARDEN_USER }}"
+    group: "{{ LINKWARDEN_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Linkwarden Meilisearch
+
+      [Container]
+      ContainerName={{ LINKWARDEN_POD_NAME }}_meili
+      Image=docker.io/getmeili/meilisearch:v1.12.8
+      Pod={{ LINKWARDEN_POD_NAME }}.pod
+      Volume={{ LINKWARDEN_MEILI_DIR }}:/meili_data:Z
+      AutoUpdate=registry
+      EnvironmentFile={{ LINKWARDEN_ENV_FILE }}
+
+      [Service]
+      Restart=always
+
+      [Install]
+      WantedBy=default.target
+
+- name: Linkwarden | Install linkwarden quadlet
+  ansible.builtin.copy:
+    dest: "{{ LINKWARDEN_QUADLET_DIR }}/{{ LINKWARDEN_POD_NAME }}.container"
+    owner: "{{ LINKWARDEN_USER }}"
+    group: "{{ LINKWARDEN_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Linkwarden
+      Wants={{ LINKWARDEN_POD_NAME }}-meili.service
+      After={{ LINKWARDEN_POD_NAME }}-meili.service
+
+      [Container]
+      ContainerName={{ LINKWARDEN_POD_NAME }}
+      Image={{ LINKWARDEN_IMAGE }}
+      Pod={{ LINKWARDEN_POD_NAME }}.pod
+      Volume={{ LINKWARDEN_DATA_DIR }}:/data/data:Z
+      AutoUpdate=registry
+      EnvironmentFile={{ LINKWARDEN_ENV_FILE }}
+
+      [Service]
+      Restart=always
+
+      [Install]
+      WantedBy=default.target
+
+- name: "Linkwarden | systemd --user daemon-reload (via machine context)"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --user -M {{ LINKWARDEN_USER }}@.host daemon-reload
+  become: true
+  changed_when: false
+
+- name: "Linkwarden | Start services pod (generated; do not enable)"
+  block:
+    - name: "Linkwarden | Start pod (generated; do not enable)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ LINKWARDEN_USER }}@.host start {{ LINKWARDEN_POD_NAME }}-pod.service
+      become: true
+      changed_when: false
+
+    - name: "Linkwarden | Start linkwarden-meili container (generated; do not enable)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ LINKWARDEN_USER }}@.host start linkwarden-meili.service
+      become: true
+      changed_when: false
+
+    - name: "Linkwarden | Start linkwarden container (generated; do not enable)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ LINKWARDEN_USER }}@.host start {{ LINKWARDEN_POD_NAME }}.service
+      become: true
+      changed_when: false
+
+#####################################################################
+# Nginx vhost
+#####################################################################
+
+- name: Linkwarden | Install nginx vhost
+  become: true
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ LINKWARDEN_FQDN }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Redirect http to https
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          listen [::]:80;
+          server_name {{ LINKWARDEN_FQDN }};
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen {{  WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ LINKWARDEN_FQDN }};
+
+          # Match your existing nginx layout (your template tasks likely drop shared TLS params here)
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log /var/log/nginx/{{ LINKWARDEN_FQDN }}_access.log main;
+          error_log  /var/log/nginx/{{ LINKWARDEN_FQDN }}_error.log warn;
+          client_max_body_size 100m;
+
+
+          location / {
+              proxy_pass http://127.0.0.1:{{ LINKWARDEN_PORT }};
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              proxy_read_timeout 300;
+              proxy_send_timeout 300;
+          }
+      }
+
+- name: "Linkwarden | Reload nginx"
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

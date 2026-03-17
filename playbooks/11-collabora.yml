@@ -1,0 +1,272 @@
+---
+# Collabora CODE (rootless Podman via quadlet) + Nginx reverse proxy
+#
+# NOTE:
+#   - Hitting https://{{ COLLABORA_FQDN }}/ will return "OK" by design.
+#   - A WOPI host (e.g. Nextcloud) is required to create/open documents in the editor UI.
+
+- name: "Collabora rootless assert required vars"
+  ansible.builtin.assert:
+      that:
+          - COLLABORA_USER is defined
+          - COLLABORA_FQDN is defined
+          - DOMAIN is defined
+      fail_msg: "Define COLLABORA_USER, COLLABORA_FQDN, and DOMAIN."
+
+- name: "Collabora rootless set hostname"
+  ansible.builtin.set_fact:
+      COLLABORA_WOPI_HOST: "{{ COLLABORA_WOPI_HOST | default('nextcloud.' ~ DOMAIN) }}"
+
+- name: "Collabora rootless set defaults"
+  ansible.builtin.set_fact:
+      COLLABORA_IMAGE: "{{ COLLABORA_IMAGE | default('docker.io/collabora/code:latest') }}"
+      COLLABORA_ADMIN_USER: "{{ COLLABORA_ADMIN_USER | default('admin') }}"
+      COLLABORA_ADMIN_PASS: "{{ COLLABORA_ADMIN_PASS | default('REPLACE_ME_STRONG') }}"
+      COLLABORA_LISTEN_ADDR: "{{ COLLABORA_LISTEN_ADDR | default('127.0.0.1') }}"
+      COLLABORA_LISTEN_PORT: "{{ COLLABORA_LISTEN_PORT | default(9980) | int }}"
+      COLLABORA_QUADLET_DIR: "/home/{{ COLLABORA_USER }}/.config/containers/systemd"
+      COLLABORA_CA_DIR: "/home/{{ COLLABORA_USER }}/.config/ca"
+      COLLABORA_CA_BUNDLE: "/home/{{ COLLABORA_USER }}/.config/ca/{{ DOMAIN }}-ca-bundle.crt"
+      COLLABORA_WOPI_HOST: "{{ COLLABORA_WOPI_HOST | default('nextcloud.' ~ DOMAIN) }}"
+      COLLABORA_WOPI_URL: "{{ COLLABORA_WOPI_URL | default('https://' ~ COLLABORA_WOPI_HOST ~ ':443') }}"
+
+- name: "Collabora rootless ensure quadlet dir exists"
+  become: true
+  ansible.builtin.file:
+      path: "{{ COLLABORA_QUADLET_DIR }}"
+      state: directory
+      owner: "{{ COLLABORA_USER }}"
+      group: "{{ COLLABORA_USER }}"
+      mode: "0755"
+
+- name: "Collabora rootless ensure CA dir exists"
+  become: true
+  ansible.builtin.file:
+      path: "{{ COLLABORA_CA_DIR }}"
+      state: directory
+      owner: "{{ COLLABORA_USER }}"
+      group: "{{ COLLABORA_USER }}"
+      mode: "0755"
+
+- name: "Collabora rootless build internal CA bundle"
+  become: true
+  ansible.builtin.shell: |
+      set -euo pipefail
+      tmp="$(mktemp)"
+      cat /etc/pki/nginx/{{ DOMAIN }}/ca.crt > "$tmp"
+      awk '
+      BEGIN {n=0}
+      /-----BEGIN CERTIFICATE-----/ {n++}
+      n==2 {print}
+      ' /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt >> "$tmp"
+      if [ -f "{{ COLLABORA_CA_BUNDLE }}" ] && cmp -s "$tmp" "{{ COLLABORA_CA_BUNDLE }}"; then
+          rm -f "$tmp"
+          exit 0
+      fi
+      install -o {{ COLLABORA_USER }} -g {{ COLLABORA_USER }} -m 0644 "$tmp" "{{ COLLABORA_CA_BUNDLE }}"
+      rm -f "$tmp"
+      echo changed
+  args:
+      executable: /bin/bash
+  register: collabora_ca_bundle_cmd
+  changed_when: "'changed' in collabora_ca_bundle_cmd.stdout"
+
+- name: "Collabora rootless write quadlet unit"
+  become: true
+  ansible.builtin.copy:
+      dest: "{{ COLLABORA_QUADLET_DIR }}/collabora.container"
+      owner: "{{ COLLABORA_USER }}"
+      group: "{{ COLLABORA_USER }}"
+      mode: "0644"
+      content: |
+          [Unit]
+          Description=Collabora Online (CODE) rootless
+          Wants=network-online.target
+          After=network-online.target
+
+          [Container]
+          ContainerName=collabora
+          Image={{ COLLABORA_IMAGE }}
+
+          # Bind only to localhost; nginx will reverse proxy.
+          PublishPort={{ COLLABORA_LISTEN_ADDR }}:{{ COLLABORA_LISTEN_PORT }}:9980/tcp
+
+          # Add the Nextcloud host.
+          AddHost=nextcloud.{{ DOMAIN }}:{{ WG_SERVER_IP }}
+
+          # Allow the WOPI host.
+          Environment=aliasgroup1={{ COLLABORA_WOPI_URL }}
+
+          # Admin console creds (optional)
+          Environment=username={{ COLLABORA_ADMIN_USER }}
+          Environment=password={{ COLLABORA_ADMIN_PASS }}
+
+          # Running behind TLS-terminating reverse proxy
+          Environment="extra_params=--o:ssl.enable=false --o:ssl.termination=true --o:server_name={{ COLLABORA_FQDN }} --o:ssl.ca_file_path=/etc/coolwsd/ca-chain.cert.pem --o:storage.wopi.host[{{ COLLABORA_WOPI_HOST }}]=true"
+
+          # If you see shared-memory related issues, uncomment:
+          # ShmSize=1024m
+
+          # Mount certificates for secure WOPI host connection.
+          Volume={{ COLLABORA_CA_BUNDLE }}:/etc/coolwsd/ca-chain.cert.pem:ro,Z
+          Volume={{ COLLABORA_CA_BUNDLE }}:/tmp/ssl/certs/ca/root.crt.pem:ro,Z
+
+          [Service]
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=default.target
+
+# - name: "Collabora rootless enable user linger (noop if already done)"
+#   become: true
+#   ansible.builtin.command: "loginctl enable-linger {{ COLLABORA_USER }}"
+#   changed_when: false
+
+- name: "Collabora | Get UID for {{ COLLABORA_USER }} (remote)"
+  ansible.builtin.command: "id -u {{ COLLABORA_USER }}"
+  register: collabora_uid
+  changed_when: false
+
+- name: "Collabora rootless systemd user daemon-reload"
+  become: true
+  become_user: "{{ COLLABORA_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ collabora_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ collabora_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "Collabora rootless restart service"
+  become: true
+  become_user: "{{ COLLABORA_USER }}"
+  ansible.builtin.command: "systemctl --user restart collabora.service"
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ collabora_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ collabora_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "Collabora SELinux allow nginx connect out"
+  become: true
+  ansible.posix.seboolean:
+      name: httpd_can_network_connect
+      state: true
+      persistent: true
+
+- name: "Collabora nginx vhost conf"
+  become: true
+  ansible.builtin.copy:
+      dest: "/etc/nginx/conf.d/{{ COLLABORA_FQDN }}.conf"
+      owner: root
+      group: root
+      mode: "0644"
+      content: |
+          # Collabora Online reverse proxy (rootless backend on {{ COLLABORA_LISTEN_ADDR }}:{{ COLLABORA_LISTEN_PORT }})
+
+          map $http_upgrade $connection_upgrade {
+              default upgrade;
+              ''      close;
+          }
+
+          upstream collabora_backend {
+              server {{ COLLABORA_LISTEN_ADDR }}:{{ COLLABORA_LISTEN_PORT }};
+          }
+
+          server {
+              listen {{  WG_SERVER_IP  }}:443 ssl;
+              http2 on;
+              server_name {{ COLLABORA_FQDN }};
+              merge_slashes off;
+
+              ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+              ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+
+              location ^~ /cool/ {
+                  proxy_pass http://collabora_backend;
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host              $host;
+                  proxy_set_header X-Real-IP         $remote_addr;
+                  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Host  $host;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_set_header X-Forwarded-Ssl   on;
+
+                  proxy_set_header Upgrade           $http_upgrade;
+                  proxy_set_header Connection        $connection_upgrade;
+
+                  proxy_read_timeout 36000s;
+                  proxy_send_timeout 36000s;
+                  proxy_buffering off;
+              }
+
+              location ^~ /browser/ {
+                  proxy_pass http://collabora_backend;
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host              $host;
+                  proxy_set_header X-Real-IP         $remote_addr;
+                  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Host  $host;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_set_header X-Forwarded-Ssl   on;
+
+                  proxy_read_timeout 36000s;
+                  proxy_send_timeout 36000s;
+                  proxy_buffering off;
+              }
+
+              location ^~ /hosting/ {
+                  proxy_pass http://collabora_backend;
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host              $host;
+                  proxy_set_header X-Real-IP         $remote_addr;
+                  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Host  $host;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_set_header X-Forwarded-Ssl   on;
+
+                  proxy_read_timeout 36000s;
+                  proxy_send_timeout 36000s;
+                  proxy_buffering off;
+              }
+
+              location ^~ /loleaflet/ {
+                  proxy_pass http://collabora_backend;
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host              $host;
+                  proxy_set_header X-Real-IP         $remote_addr;
+                  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Host  $host;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_set_header X-Forwarded-Ssl   on;
+
+                  proxy_read_timeout 36000s;
+                  proxy_send_timeout 36000s;
+                  proxy_buffering off;
+              }
+
+              location / {
+                  proxy_pass http://collabora_backend;
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host              $host;
+                  proxy_set_header X-Real-IP         $remote_addr;
+                  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Host  $host;
+                  proxy_set_header X-Forwarded-Proto https;
+                  proxy_set_header X-Forwarded-Ssl   on;
+
+                  proxy_read_timeout 3600;
+                  proxy_send_timeout 3600;
+                  proxy_buffering off;
+              }
+          }
+
+- name: "Collabora reload nginx"
+  become: true
+  ansible.builtin.systemd:
+      name: nginx
+      state: reloaded

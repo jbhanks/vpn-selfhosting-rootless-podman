@@ -1,0 +1,16 @@
+[Unit]
+Description=Promtail
+After=loki.service
+
+[Container]
+Image=docker.io/grafana/promtail:3.0.0
+ContainerName=promtail
+PublishPort={{ PROMTAIL_BIND }}:{{ PROMTAIL_PORT }}:{{ PROMTAIL_PORT }}
+Volume=/etc/promtail:/etc/promtail:ro
+Volume={{ PROMTAIL_DATA_DIR }}:/promtail:Z
+Volume=/var/log/journal:/var/log/journal:ro
+Volume=/run/log/journal:/run/log/journal:ro
+Exec=promtail -config.file=/etc/promtail/promtail.yaml
+
+[Install]
+WantedBy=default.target

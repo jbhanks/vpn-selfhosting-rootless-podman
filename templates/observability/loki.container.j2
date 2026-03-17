@@ -1,0 +1,13 @@
+[Unit]
+Description=Loki
+
+[Container]
+Image=docker.io/grafana/loki:3.0.0
+ContainerName=loki
+PublishPort={{ LOKI_BIND }}:{{ LOKI_PORT }}:{{ LOKI_PORT }}
+Volume=/etc/loki:/etc/loki:ro
+Volume={{ LOKI_DATA_DIR }}:/loki:Z
+Exec=loki -config.file=/etc/loki/loki.yaml
+
+[Install]
+WantedBy=default.target

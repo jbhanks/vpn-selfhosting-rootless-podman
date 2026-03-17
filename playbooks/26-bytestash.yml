@@ -1,0 +1,253 @@
+###############################################################################
+# ByteStash (rootless podman + quadlet, user-scoped) + nginx reverse proxy
+###############################################################################
+
+- name: "ByteStash | Set base vars / defaults"
+  ansible.builtin.set_fact:
+      BYTESTASH_HOST: "{{ BYTESTASH_HOST | default('bytestash.' ~ DOMAIN) }}"
+      BYTESTASH_USER: "{{ BYTESTASH_USER | default('bytestash') }}"
+
+      # Host paths
+      BYTESTASH_ROOT: "{{ BYTESTASH_ROOT | default('/opt/bytestash') }}"
+      BYTESTASH_ENV_DIR: "{{ BYTESTASH_ENV_DIR | default('/etc/bytestash') }}"
+
+
+      # Container / ports
+      BYTESTASH_IMAGE: "{{ BYTESTASH_IMAGE | default('ghcr.io/jordan-dalby/bytestash:latest') }}"
+      BYTESTASH_CONTAINER_PORT_HTTP: "{{ BYTESTASH_CONTAINER_PORT_HTTP | default('5000') }}"
+      BYTESTASH_HOST_PORT_HTTP: "{{ BYTESTASH_HOST_PORT_HTTP | default('5050') }}"
+      BYTESTASH_BIND_IP: "{{ BYTESTASH_BIND_IP | default('127.0.0.1') }}"
+
+      # App config (ByteStash env vars)
+      BYTESTASH_BASE_PATH: "{{ BYTESTASH_BASE_PATH | default('') }}"
+      BYTESTASH_TOKEN_EXPIRY: "{{ BYTESTASH_TOKEN_EXPIRY | default('24h') }}"
+      BYTESTASH_ALLOW_NEW_ACCOUNTS: "{{ BYTESTASH_ALLOW_NEW_ACCOUNTS | default('true') }}"
+      BYTESTASH_DEBUG: "{{ BYTESTASH_DEBUG | default('false') }}"
+
+- name: "ByteStash | Set base vars / defaults part 2"
+  ansible.builtin.set_fact:
+      # If set, include the vhost so reverse proxy Host header is accepted
+      BYTESTASH_ALLOWED_HOSTS: "{{ BYTESTASH_ALLOWED_HOSTS | default(BYTESTASH_HOST) }}"
+      BYTESTASH_DATA_DIR: "{{ BYTESTASH_DATA_DIR | default(BYTESTASH_ROOT ~ '/data') }}"
+      BYTESTASH_ENV_FILE: "{{ BYTESTASH_ENV_FILE | default(BYTESTASH_ENV_DIR ~ '/bytestash.env') }}"
+      BYTESTASH_QUADLET_DIR: "/home/{{ BYTESTASH_USER }}/.config/containers/systemd"
+
+      # Optional OIDC (leave disabled unless you configure it)
+      BYTESTASH_OIDC_ENABLED: "{{ BYTESTASH_OIDC_ENABLED | default('false') }}"
+      BYTESTASH_OIDC_DISPLAY_NAME: "{{ BYTESTASH_OIDC_DISPLAY_NAME | default('') }}"
+      BYTESTASH_OIDC_ISSUER_URL: "{{ BYTESTASH_OIDC_ISSUER_URL | default('') }}"
+      BYTESTASH_OIDC_CLIENT_ID: "{{ BYTESTASH_OIDC_CLIENT_ID | default('') }}"
+      BYTESTASH_OIDC_CLIENT_SECRET: "{{ BYTESTASH_OIDC_CLIENT_SECRET | default('') }}"
+      BYTESTASH_OIDC_SCOPES: "{{ BYTESTASH_OIDC_SCOPES | default('') }}"
+
+- name: "ByteStash | Assert required vars"
+  ansible.builtin.assert:
+      that:
+          - DOMAIN is defined
+          - WG_SERVER_IP is defined
+          - BYTESTASH_JWT_SECRET is defined
+      fail_msg: "Define DOMAIN, WG_SERVER_IP, and BYTESTASH_JWT_SECRET (used for signing auth tokens)."
+
+###############################################################################
+# User + dirs
+###############################################################################
+
+- name: "ByteStash | Ensure service user exists"
+  ansible.builtin.user:
+      name: "{{ BYTESTASH_USER }}"
+      home: "/home/{{ BYTESTASH_USER }}"
+      shell: /bin/bash
+      create_home: true
+      state: present
+  become: true
+
+- name: "ByteStash | Ensure persistent directories exist"
+  ansible.builtin.file:
+      path: "{{ item.path }}"
+      state: directory
+      owner: "{{ item.owner }}"
+      group: "{{ item.group }}"
+      mode: "{{ item.mode }}"
+  loop:
+      - { path: "{{ BYTESTASH_ROOT }}",       owner: "root",            group: "root",            mode: "0755" }
+      - { path: "{{ BYTESTASH_DATA_DIR }}",  owner: "{{ BYTESTASH_USER }}", group: "{{ BYTESTASH_USER }}", mode: "0750" }
+      - { path: "{{ BYTESTASH_ENV_DIR }}",   owner: "root",            group: "{{ BYTESTASH_USER }}", mode: "0750" }
+      - { path: "{{ BYTESTASH_QUADLET_DIR }}", owner: "{{ BYTESTASH_USER }}", group: "{{ BYTESTASH_USER }}", mode: "0750" }
+  become: true
+
+- name: "ByteStash | Preflight: check podman is installed (as {{ BYTESTASH_USER }})"
+  ansible.builtin.command: "sudo -u {{ BYTESTASH_USER }} podman --version"
+  args:
+      chdir: "/home/{{ BYTESTASH_USER }}"
+  environment:
+      HOME: "/home/{{ BYTESTASH_USER }}"
+  register: bytestash_podman_version
+  changed_when: false
+
+###############################################################################
+# Runtime facts for root controlling rootless systemd (XDG + DBUS)
+###############################################################################
+
+- name: "ByteStash | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+      - name: "ByteStash | Get UID of {{ BYTESTASH_USER }}"
+        ansible.builtin.command: "id -u {{ BYTESTASH_USER }}"
+        register: bytestash_uid
+        changed_when: false
+
+      - name: "ByteStash | Set runtime facts"
+        ansible.builtin.set_fact:
+            BYTESTASH_UID: "{{ bytestash_uid.stdout | trim }}"
+            BYTESTASH_XDG_RUNTIME_DIR: "/run/user/{{ bytestash_uid.stdout | trim }}"
+            BYTESTASH_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ bytestash_uid.stdout | trim }}/bus"
+
+      - name: "ByteStash | Ensure XDG runtime dir exists"
+        ansible.builtin.file:
+            path: "{{ BYTESTASH_XDG_RUNTIME_DIR }}"
+            state: directory
+            owner: "{{ BYTESTASH_USER }}"
+            group: "{{ BYTESTASH_USER }}"
+            mode: "0700"
+
+      - name: "ByteStash | Ensure user manager is started (user@UID)"
+        ansible.builtin.systemd:
+            name: "user@{{ BYTESTASH_UID }}.service"
+            state: started
+  become: true
+
+###############################################################################
+# Env file
+###############################################################################
+
+- name: "ByteStash | Write env file"
+  ansible.builtin.copy:
+      dest: "{{ BYTESTASH_ENV_FILE }}"
+      owner: root
+      group: "{{ BYTESTASH_USER }}"
+      mode: "0640"
+      content: |
+          # ByteStash
+          BASE_PATH={{ BYTESTASH_BASE_PATH }}
+          ALLOWED_HOSTS={{ BYTESTASH_ALLOWED_HOSTS }}
+
+          JWT_SECRET={{ BYTESTASH_JWT_SECRET }}
+          TOKEN_EXPIRY={{ BYTESTASH_TOKEN_EXPIRY }}
+          ALLOW_NEW_ACCOUNTS={{ BYTESTASH_ALLOW_NEW_ACCOUNTS }}
+          DEBUG={{ BYTESTASH_DEBUG }}
+
+          # Optional OIDC
+          OIDC_ENABLED={{ BYTESTASH_OIDC_ENABLED }}
+          OIDC_DISPLAY_NAME={{ BYTESTASH_OIDC_DISPLAY_NAME }}
+          OIDC_ISSUER_URL={{ BYTESTASH_OIDC_ISSUER_URL }}
+          OIDC_CLIENT_ID={{ BYTESTASH_OIDC_CLIENT_ID }}
+          OIDC_CLIENT_SECRET={{ BYTESTASH_OIDC_CLIENT_SECRET }}
+          OIDC_SCOPES={{ BYTESTASH_OIDC_SCOPES }}
+  become: true
+
+###############################################################################
+# Quadlets (pod + container)
+###############################################################################
+
+- name: "ByteStash | Write Quadlet pod file"
+  ansible.builtin.copy:
+      dest: "{{ BYTESTASH_QUADLET_DIR }}/bytestash.pod"
+      owner: "{{ BYTESTASH_USER }}"
+      group: "{{ BYTESTASH_USER }}"
+      mode: "0644"
+      content: |
+          [Pod]
+          PodName=bytestash
+          PublishPort={{ BYTESTASH_BIND_IP }}:{{ BYTESTASH_HOST_PORT_HTTP }}:{{ BYTESTASH_CONTAINER_PORT_HTTP }}
+  become: true
+
+- name: "ByteStash | Write Quadlet container file"
+  ansible.builtin.copy:
+      dest: "{{ BYTESTASH_QUADLET_DIR }}/bytestash.container"
+      owner: "{{ BYTESTASH_USER }}"
+      group: "{{ BYTESTASH_USER }}"
+      mode: "0644"
+      content: |
+          [Container]
+          ContainerName=bytestash
+          Image={{ BYTESTASH_IMAGE }}
+          Pod=bytestash.pod
+          EnvironmentFile={{ BYTESTASH_ENV_FILE }}
+
+          # Persist snippets DB/files
+          Volume={{ BYTESTASH_DATA_DIR }}:/data/snippets:Z
+
+          [Service]
+          Restart=always
+  become: true
+
+- name: "ByteStash | systemd --user daemon-reload (via machine context)"
+  ansible.builtin.command:
+      cmd: >-
+          systemctl --user -M {{ BYTESTASH_USER }}@.host daemon-reload
+  become: true
+  changed_when: false
+
+- name: "ByteStash | Start services (generated; do not enable)"
+  block:
+      - name: "ByteStash | Start pod (generated; do not enable)"
+        ansible.builtin.command:
+            cmd: >-
+                systemctl --user -M {{ BYTESTASH_USER }}@.host start bytestash-pod.service
+        changed_when: false
+        become: true
+
+      - name: "ByteStash | Start container (generated; do not enable)"
+        ansible.builtin.command:
+            cmd: >-
+                systemctl --user -M {{ BYTESTASH_USER }}@.host start bytestash.service
+        changed_when: false
+        become: true
+
+###############################################################################
+# nginx vhost
+###############################################################################
+
+- name: "ByteStash | Install nginx vhost"
+  ansible.builtin.copy:
+      dest: "/etc/nginx/conf.d/{{ BYTESTASH_HOST }}.conf"
+      owner: root
+      group: root
+      mode: "0644"
+      content: |
+          server {
+              listen {{ WG_SERVER_IP }}:80;
+              server_name {{ BYTESTASH_HOST }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen {{ WG_SERVER_IP }}:443 ssl;
+              http2 on;
+              server_name {{ BYTESTASH_HOST }};
+
+              include /etc/nginx/default.d/*.conf;
+              ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+              ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+              access_log  /var/log/nginx/{{ BYTESTASH_HOST }}_access.log  main;
+              error_log   /var/log/nginx/{{ BYTESTASH_HOST }}_error.log warn;
+
+              client_max_body_size 0;
+              underscores_in_headers on;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ BYTESTASH_HOST_PORT_HTTP }}/;
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+  become: true
+
+- name: "ByteStash | Reload nginx"
+  ansible.builtin.service:
+      name: nginx
+      state: reloaded
+  become: true

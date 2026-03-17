@@ -1,0 +1,59 @@
+---
+- name: "reset_crypto_policy"
+  ansible.builtin.command: update-crypto-policies --set DEFAULT
+
+# Run `daemon-reload` when anything asks for the sshd reload group
+- name: "systemd daemon-reload"
+  listen: "Reload systemd and daemon-reload"
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: "restart sshd"
+  listen: "Reload systemd and restart sshd"
+  ansible.builtin.systemd:
+    name: sshd
+    state: restarted
+    enabled: true
+
+# UFW handler (optional)
+- name: "reload ufw"
+  listen: "Reload UFW"
+  ansible.builtin.command: ufw reload
+  changed_when: false
+
+# Fail2ban handler
+- name: "restart fail2ban"
+  listen: "Restart fail2ban"
+  ansible.builtin.systemd:
+    name: fail2ban
+    state: restarted
+
+- name: "apply-sysctl"
+  listen: "apply-sysctl"
+  ansible.builtin.command: sysctl --system
+  changed_when: false
+
+- name: "restart-journald"
+  listen: "restart-journald"
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted
+
+- name: "daemon-reload"
+  listen: ["daemon-reload", "Reload systemd", "systemd-daemon-reload"]
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# Optional: apply getty drop-in immediately when we ask for daemon-reload
+- name: "restart-getty-tty1"
+  listen: ["restart-getty-tty1"]
+  ansible.builtin.systemd:
+    name: "getty@tty1.service"
+    state: restarted
+
+- name: "Reload nginx"
+  listen: "Reload nginx"
+  become: true
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

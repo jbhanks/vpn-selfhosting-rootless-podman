@@ -1,0 +1,124 @@
+---
+- name: VPS converge
+  hosts: "{{ TARGET | default('services') }}"
+  become: true
+  gather_facts: true
+
+  vars_files:
+      - Secrets/vault.yml
+
+  tasks:
+    - name: Common baseline 001.0
+      ansible.builtin.import_tasks: playbooks/001.0-prepare-storage-volume.yml
+
+    - name: Common baseline 001.1
+      ansible.builtin.import_tasks: playbooks/001.1-base-system-bootstrap.yml
+
+    - name: Common baseline 001.2
+      ansible.builtin.import_tasks: playbooks/001.2-users-and-git-access.yml
+  
+    - name: Common baseline 001.3
+      ansible.builtin.import_tasks: playbooks/001.3-ssh-firewall-hardening.yml
+
+    - name: Common baseline 001.4
+      ansible.builtin.import_tasks: playbooks/001.4-configure-backups-and-resources.yml
+
+    - name: DB setup
+      ansible.builtin.import_tasks: playbooks/02-postgres.yml
+
+    - name: Nginx setup
+      ansible.builtin.import_tasks: playbooks/03-nginx.yml
+
+    - name: Podman baseline
+      ansible.builtin.import_tasks: playbooks/04-podman.yml
+
+    - name: Configure Nginx
+      ansible.builtin.import_tasks: playbooks/05-configure_nginx.yml
+
+    - name: Sleep after nginx
+      pause:
+        seconds: 60
+
+    - name: Add robots.txt
+      # import_tasks: admin_common/add_robots.yml
+      shell: |
+        cat<<EOF|sudo tee /etc/nginx/robots.conf
+        add_header  Content-Type  text/plain;
+        return 200 "User-agent: *\nDisallow: /\n";
+        EOF
+
+    - name: Wireguard
+      ansible.builtin.import_tasks: playbooks/06-wireguard.yml
+  
+    - name: Certificate authority and certificates
+      ansible.builtin.import_tasks: playbooks/07-vpn-pki-nginx.yml
+
+    - name: AppFlowy (podman quadlet + nginx vhost)
+      ansible.builtin.import_tasks: playbooks/08-appflowy.yml
+
+    - name: TriliumNext (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/09-trilium-next.yml
+
+    - name: Nextcloud
+      ansible.builtin.import_tasks: playbooks/10-nextcloud.yml
+  
+    - name: Collabora (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/11-collabora.yml
+
+    - name: Koillection (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/12-koillection.yml
+
+    - name: firefly3 (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/13-firefly3.yml
+
+    - name: Gitea (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/14-gitea.yml
+  
+    - name: grocy (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/15-grocy.yml
+
+    - name: Joplin (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/16-joplin.yml
+  
+    - name: Memos (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/17-memos.yml
+
+    - name: XWiki (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/18-xwiki.yml
+
+    - name: Linkwarden (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/19-linkwarden.yml
+
+    - name: TeamMapper (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/20-teammapper.yml
+
+    - name: Wallabag (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/21-wallabag.yml
+
+    - name: Ghostfolio (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/22-ghostfolio.yml
+  
+    - name: Redmine (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/23-redmine.yml
+
+    - name: Bitwarden (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/24-bitwarden.yml
+
+    - name: OwnTracks (podman quadlet)
+      ansible.builtin.import_tasks: playbooks/25-owntracks.yml
+
+    - name: Bytestash
+      ansible.builtin.import_tasks: playbooks/26-bytestash.yml
+
+    - name: Ntfy
+      ansible.builtin.import_tasks: playbooks/27-ntfy.yml
+
+    - name: Observability
+      ansible.builtin.import_tasks: playbooks/28-observability.yml
+
+    - name: Lockdown
+      ansible.builtin.import_tasks: playbooks/99-lockdown.yml
+
+
+  handlers:
+    - ansible.builtin.import_tasks: handlers.yml

@@ -1,0 +1,386 @@
+###############################################################################
+# ntfy (rootless podman + quadlet, user-scoped) + nginx reverse proxy
+###############################################################################
+
+- name: "ntfy | Set derived vars / defaults"
+  ansible.builtin.set_fact:
+      NTFY_HOST: "{{ NTFY_HOST | default('ntfy.' ~ DOMAIN) }}"
+      NTFY_USER: "{{ NTFY_USER | default('ntfy') }}"
+      NTFY_IMAGE: "{{ NTFY_IMAGE | default('docker.io/binwiederhier/ntfy@sha256:4768ca4ed07bf5ba0331f333bfccc541ba1594ed7fa5a7b0245763a581809344') }}"
+
+      # We’ll run ntfy on an internal container port and publish it to loopback.
+      NTFY_CONTAINER_PORT_HTTP: "{{ NTFY_CONTAINER_PORT_HTTP | default('2586') }}"
+      NTFY_HOST_PORT_HTTP: "{{ NTFY_HOST_PORT_HTTP | default('8686') }}"
+
+      # Host paths
+      NTFY_ROOT: "{{ NTFY_ROOT | default(BLOCKDEV ~'/ntfy') }}"
+      NTFY_DATA_DIR: "{{ NTFY_DATA_DIR | default(NTFY_ROOT ~ '/data') }}"
+      NTFY_CACHE_DIR: "{{ NTFY_CACHE_DIR | default(NTFY_ROOT ~ '/cache') }}"
+      NTFY_ENV_DIR: "{{ NTFY_ENV_DIR | default('/etc/ntfy') }}"
+      NTFY_CONFIG_FILE: "{{ NTFY_CONFIG_FILE | default('/etc/ntfy/server.yml') }}"
+      NTFY_QUADLET_DIR: "/home/{{ NTFY_USER }}/.config/containers/systemd"
+
+- name: "ntfy | Preflight: ensure required vars exist"
+  ansible.builtin.assert:
+      that:
+          - DOMAIN is defined
+          - WG_SERVER_IP is defined
+      fail_msg: >-
+          Missing required vars. Ensure DOMAIN and WG_SERVER_IP are present in vars.yml.
+
+- name: "ntfy | Preflight: ensure admin credentials exist"
+  ansible.builtin.assert:
+      that:
+          - NTFY_ADMIN_USER is defined
+          - NTFY_ADMIN_PASS is defined
+      fail_msg: >-
+          You must define NTFY_ADMIN_USER and NTFY_ADMIN_PASS.
+
+###############################################################################
+# Dirs
+###############################################################################
+
+- name: "ntfy | Ensure persistent directories exist"
+  ansible.builtin.file:
+      path: "{{ item.path }}"
+      state: directory
+      owner: "{{ item.owner }}"
+      group: "{{ item.group }}"
+      mode: "{{ item.mode }}"
+  loop:
+      - { path: "{{ NTFY_ROOT }}", owner: "root", group: "root", mode: "0755" }
+      - { path: "{{ NTFY_DATA_DIR }}", owner: "{{ NTFY_USER }}", group: "{{ NTFY_USER }}", mode: "0750" }
+      - { path: "{{ NTFY_CACHE_DIR }}", owner: "{{ NTFY_USER }}", group: "{{ NTFY_USER }}", mode: "0750" }
+      - { path: "{{ NTFY_CACHE_DIR }}/attachments", owner: "{{ NTFY_USER }}", group: "{{ NTFY_USER }}", mode: "0750" }
+      - { path: "{{ NTFY_ENV_DIR }}", owner: "root", group: "root", mode: "0755" }
+      - { path: "{{ NTFY_QUADLET_DIR }}", owner: "{{ NTFY_USER }}", group: "{{ NTFY_USER }}", mode: "0750" }
+  become: true
+
+- name: "ntfy | Ensure {{ NTFY_USER }} homedir is writable (required for rootless podman storage)"
+  ansible.builtin.file:
+      path: "/home/{{ NTFY_USER }}"
+      state: directory
+      owner: "{{ NTFY_USER }}"
+      group: "{{ NTFY_USER }}"
+      mode: "0750"
+  become: true
+
+###############################################################################
+# ntfy config
+###############################################################################
+
+- name: "ntfy | Write server.yml"
+  ansible.builtin.copy:
+      dest: "{{ NTFY_CONFIG_FILE }}"
+      owner: root
+      group: "{{ NTFY_USER }}"
+      mode: "0640"
+      content: |
+          # ntfy server config
+          base-url: "https://{{ NTFY_HOST }}"
+          listen-http: ":{{ NTFY_CONTAINER_PORT_HTTP }}"
+          behind-proxy: true
+
+          # Persistence
+          cache-file: "/var/cache/ntfy/cache.db"
+          auth-file: "/var/lib/ntfy/auth.db"
+          attachment-cache-dir: "/var/cache/ntfy/attachments"
+
+          # Auth behavior
+          enable-login: true
+          enable-signup: false
+          auth-default-access: "deny-all"
+  become: true
+  no_log: true
+
+###############################################################################
+# Quadlets (pod + container)
+###############################################################################
+
+- name: "ntfy | Write Quadlet pod file"
+  ansible.builtin.copy:
+      dest: "{{ NTFY_QUADLET_DIR }}/ntfy.pod"
+      owner: "{{ NTFY_USER }}"
+      group: "{{ NTFY_USER }}"
+      mode: "0644"
+      content: |
+          [Pod]
+          PodName=ntfy
+          PublishPort=127.0.0.1:{{ NTFY_HOST_PORT_HTTP }}:{{ NTFY_CONTAINER_PORT_HTTP }}
+
+- name: "ntfy | Write Quadlet container file"
+  ansible.builtin.copy:
+      dest: "{{ NTFY_QUADLET_DIR }}/ntfy.container"
+      owner: "{{ NTFY_USER }}"
+      group: "{{ NTFY_USER }}"
+      mode: "0644"
+      content: |
+          [Container]
+          ContainerName=ntfy
+          Image={{ NTFY_IMAGE }}
+          Pod=ntfy.pod
+
+          # Image entrypoint is already "ntfy"; pass only args here.
+          Exec=serve --config /etc/ntfy/server.yml
+
+          Volume={{ NTFY_CONFIG_FILE }}:/etc/ntfy/server.yml:ro
+          Volume={{ NTFY_DATA_DIR }}:/var/lib/ntfy:Z
+          Volume={{ NTFY_CACHE_DIR }}:/var/cache/ntfy:Z
+
+          [Service]
+          Restart=always
+
+###############################################################################
+# Start / bootstrap (generated; do not enable)
+###############################################################################
+
+- name: "ntfy | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+      - name: "ntfy | Get UID of {{ NTFY_USER }}"
+        ansible.builtin.command: "id -u {{ NTFY_USER }}"
+        register: ntfy_uid
+        changed_when: false
+
+      - name: "ntfy | Set runtime facts"
+        ansible.builtin.set_fact:
+            NTFY_UID: "{{ ntfy_uid.stdout | trim }}"
+            NTFY_XDG_RUNTIME_DIR: "/run/user/{{ ntfy_uid.stdout | trim }}"
+            NTFY_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ntfy_uid.stdout | trim }}/bus"
+
+      - name: "ntfy | Ensure XDG runtime dir exists"
+        ansible.builtin.file:
+            path: "{{ NTFY_XDG_RUNTIME_DIR }}"
+            state: directory
+            owner: "{{ NTFY_USER }}"
+            group: "{{ NTFY_USER }}"
+            mode: "0700"
+
+      - name: "ntfy | Ensure user manager is started (user@UID)"
+        ansible.builtin.systemd:
+            name: "user@{{ NTFY_UID }}.service"
+            state: started
+  become: true
+
+- name: "ntfy | systemd --user daemon-reload (via machine context)"
+  ansible.builtin.command:
+      cmd: >-
+          systemctl --user -M {{ NTFY_USER }}@.host daemon-reload
+  become: true
+  changed_when: false
+
+- name: "ntfy | Restart services and bootstrap admin user"
+  block:
+      - name: "ntfy | Restart pod (generated; do not enable)"
+        ansible.builtin.command:
+            cmd: >-
+                systemctl --user -M {{ NTFY_USER }}@.host restart ntfy-pod.service
+        become: true
+        changed_when: false
+
+      - name: "ntfy | Wait for ntfy service to report active"
+        ansible.builtin.command:
+            cmd: >-
+                systemctl --user -M {{ NTFY_USER }}@.host is-active ntfy.service
+        become: true
+        register: ntfy_is_active
+        changed_when: false
+        retries: 20
+        delay: 1
+        until: ntfy_is_active.stdout | trim == "active"
+
+      - name: "ntfy | Wait until podman exec works"
+        ansible.builtin.command:
+            argv:
+                - podman
+                - exec
+                - ntfy
+                - ntfy
+                - user
+                - list
+        become: true
+        become_user: "{{ NTFY_USER }}"
+        environment:
+            HOME: "/home/{{ NTFY_USER }}"
+            USER: "{{ NTFY_USER }}"
+            LOGNAME: "{{ NTFY_USER }}"
+            XDG_RUNTIME_DIR: "{{ NTFY_XDG_RUNTIME_DIR }}"
+            DBUS_SESSION_BUS_ADDRESS: "{{ NTFY_DBUS_SESSION_BUS_ADDRESS }}"
+        register: ntfy_user_list
+        changed_when: false
+        retries: 20
+        delay: 1
+        until: ntfy_user_list.rc == 0
+
+      - name: "ntfy | Create admin user in auth DB if missing"
+        ansible.builtin.command:
+            argv:
+                - podman
+                - exec
+                - -e
+                - "NTFY_PASSWORD={{ NTFY_ADMIN_PASS }}"
+                - ntfy
+                - ntfy
+                - user
+                - add
+                - --role=admin
+                - "{{ NTFY_ADMIN_USER }}"
+        become: true
+        become_user: "{{ NTFY_USER }}"
+        environment:
+            HOME: "/home/{{ NTFY_USER }}"
+            USER: "{{ NTFY_USER }}"
+            LOGNAME: "{{ NTFY_USER }}"
+            XDG_RUNTIME_DIR: "{{ NTFY_XDG_RUNTIME_DIR }}"
+            DBUS_SESSION_BUS_ADDRESS: "{{ NTFY_DBUS_SESSION_BUS_ADDRESS }}"
+        when: ntfy_user_list.stdout is not search('(^|\\n)user\\s+' ~ (NTFY_ADMIN_USER | regex_escape) ~ '\\s*\\(')
+        no_log: true
+
+      - name: "ntfy | Verify admin user exists"
+        ansible.builtin.command:
+            argv:
+                - podman
+                - exec
+                - ntfy
+                - ntfy
+                - user
+                - list
+        become: true
+        become_user: "{{ NTFY_USER }}"
+        environment:
+            HOME: "/home/{{ NTFY_USER }}"
+            USER: "{{ NTFY_USER }}"
+            LOGNAME: "{{ NTFY_USER }}"
+            XDG_RUNTIME_DIR: "{{ NTFY_XDG_RUNTIME_DIR }}"
+            DBUS_SESSION_BUS_ADDRESS: "{{ NTFY_DBUS_SESSION_BUS_ADDRESS }}"
+        register: ntfy_user_list_verify
+        changed_when: false
+        failed_when: ntfy_user_list_verify.stdout is not search('(^|\\n)user\\s+' ~ (NTFY_ADMIN_USER | regex_escape) ~ '\\s*\\(')
+
+  rescue:
+      - name: "ntfy | Status (debug)"
+        ansible.builtin.command:
+            cmd: >-
+                systemctl --user -M {{ NTFY_USER }}@.host
+                status ntfy.service ntfy-pod.service --no-pager
+        become: true
+        changed_when: false
+        failed_when: false
+        register: ntfy_status
+
+      - name: "ntfy | Journal (debug: pod)"
+        ansible.builtin.command:
+            cmd: >-
+                journalctl --user -xeu ntfy-pod.service --no-pager
+        become: true
+        become_user: "{{ NTFY_USER }}"
+        changed_when: false
+        failed_when: false
+        register: ntfy_pod_journal
+
+      - name: "ntfy | Journal (debug: container)"
+        ansible.builtin.command:
+            cmd: >-
+                journalctl --user -xeu ntfy.service --no-pager
+        become: true
+        become_user: "{{ NTFY_USER }}"
+        changed_when: false
+        failed_when: false
+        register: ntfy_container_journal
+
+      - name: "ntfy | Show pod journal"
+        ansible.builtin.debug:
+            var: ntfy_pod_journal.stdout_lines
+
+      - name: "ntfy | Show container journal"
+        ansible.builtin.debug:
+            var: ntfy_container_journal.stdout_lines
+
+      - name: "ntfy | Show status"
+        ansible.builtin.debug:
+            var: ntfy_status.stdout_lines
+
+      - name: "ntfy | Fail after diagnostics"
+        ansible.builtin.fail:
+            msg: "ntfy bootstrap check failed; service status is shown above."
+
+###############################################################################
+# nginx vhost
+###############################################################################
+
+- name: "ntfy | Install nginx vhost"
+  ansible.builtin.copy:
+      dest: "/etc/nginx/conf.d/{{ NTFY_HOST }}.conf"
+      owner: root
+      group: root
+      mode: "0644"
+      content: |
+          server {
+              listen {{ WG_SERVER_IP }}:80;
+              server_name {{ NTFY_HOST }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen {{ WG_SERVER_IP }}:443 ssl;
+              http2 on;
+              server_name {{ NTFY_HOST }};
+
+              include /etc/nginx/default.d/*.conf;
+              ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+              ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+
+              access_log /var/log/nginx/{{ NTFY_HOST }}_access.log main;
+              error_log  /var/log/nginx/{{ NTFY_HOST }}_error.log warn;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ NTFY_HOST_PORT_HTTP }}/;
+
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Port $server_port;
+
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+
+                  proxy_read_timeout 3600;
+                  proxy_send_timeout 3600;
+              }
+          }
+  become: true
+
+- name: "ntfy | nginx config test"
+  ansible.builtin.command: nginx -t
+  changed_when: false
+  become: true
+
+- name: "ntfy | Reload nginx"
+  ansible.builtin.service:
+      name: nginx
+      state: reloaded
+  become: true
+
+- name: "ntfy | Create normal user if missing"
+  ansible.builtin.command:
+      argv:
+          - podman
+          - exec
+          - -e
+          - "NTFY_PASSWORD={{ NTFY_USER_PASS }}"
+          - ntfy
+          - ntfy
+          - user
+          - add
+          - "{{ NTFY_NORMAL_USER }}"
+  become: true
+  become_user: "{{ NTFY_USER }}"
+  environment:
+      HOME: "/home/{{ NTFY_USER }}"
+      USER: "{{ NTFY_USER }}"
+      LOGNAME: "{{ NTFY_USER }}"
+      XDG_RUNTIME_DIR: "{{ NTFY_XDG_RUNTIME_DIR }}"
+      DBUS_SESSION_BUS_ADDRESS: "{{ NTFY_DBUS_SESSION_BUS_ADDRESS }}"
+  when: ntfy_user_list.stdout is not search('(^|\\n)user\\s+' ~ (NTFY_NORMAL_USER | regex_escape) ~ '\\s*\\(')
+  no_log: true

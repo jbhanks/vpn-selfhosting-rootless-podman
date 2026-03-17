@@ -1,0 +1,317 @@
+---
+- name: "UFW: Disable IPv6 support"
+  ansible.builtin.lineinfile:
+    path: /etc/default/ufw
+    regexp: '^IPV6='
+    line: 'IPV6=no'
+    create: true
+    backup: true
+
+- name: Enable UFW
+  ansible.builtin.command: ufw --force enable
+  changed_when: "'already enabled' not in ufw_enable_result.stdout|default('')"
+  register: ufw_enable_result
+
+- name: UFW allow admin ports (idempotent)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: [22, "{{ ADMINPORT | int }}"]
+  notify: Reload UFW
+
+- name: Ensure sshd is enabled and running
+  ansible.builtin.systemd:
+    name: sshd
+    enabled: true
+    state: started
+
+# Ensure UFW drop-in exists and is sane
+- name: Create systemd drop-in dir for ufw
+  ansible.builtin.file:
+    path: /etc/systemd/system/ufw.service.d
+    state: directory
+    mode: "0755"
+
+- name: Reload systemd and (re)enable ufw
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: ufw
+    enabled: true
+    state: started
+
+- name: Ensure /etc/ssh/authorized_keys exists (for system-wide path)
+  ansible.builtin.file:
+    path: /etc/ssh/authorized_keys
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Adjust sshd_config (safe templating)
+  vars:
+    _allow_users: >-
+      {{ (['root', ADMINUSER|default('')]
+          | reject('equalto','') | list) }}
+
+  ansible.builtin.blockinfile:
+    path: /etc/ssh/sshd_config
+    create: true
+    marker: "# {mark} ANSIBLE MANAGED BLOCK"
+    block: |
+      PasswordAuthentication no
+      AllowUsers {{ _allow_users | join(' ') }}
+      Port {{ ADMINPORT | int }}
+      AuthorizedKeysFile %h/.ssh/authorized_keys /etc/ssh/authorized_keys/%u
+      UseDNS no
+  notify: Reload systemd and restart sshd
+
+- name: Validate sshd_config syntax
+  ansible.builtin.command: /usr/sbin/sshd -t -f /etc/ssh/sshd_config
+  changed_when: false
+
+- name: Ensure semanage is available
+  ansible.builtin.dnf:
+    name: policycoreutils-python-utils
+    state: present
+
+- name: Check if ADMINPORT already labeled ssh_port_t
+  ansible.builtin.command: >
+    semanage port -l | grep -E '^ssh_port_t\b.*\b{{ ADMINPORT }}\b'
+  register: ssh_port_label
+  changed_when: false
+  failed_when: false
+
+- name: Add SELinux port mapping for sshd
+  ansible.builtin.command: >
+    semanage port -a -t ssh_port_t -p tcp {{ ADMINPORT }}
+  when: ssh_port_label.rc != 0
+
+- name: Flush handlers so sshd picks up changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Sudo policy | Ensure {{ ADMINUSER }} is in wheel
+  ansible.builtin.user:
+    name: "{{ ADMINUSER }}"
+    groups: wheel
+    append: true
+
+# Ensure app/service users are NOT in wheel
+- name: Sudo policy | Ensure service users are not in wheel
+  ansible.builtin.user:
+    name: "{{ item }}"
+    append: true
+  loop: "{{ [APPUSER] + APPS }}"
+
+- name: Restore SELinux contexts on SSH dirs
+  ansible.builtin.command: >
+    restorecon -Rv
+    /root/.ssh
+    /home/{{ ADMINUSER }}/.ssh
+    {% for u in (APPS | default([])) %}/home/{{ u }}/.ssh {% endfor %}
+  changed_when: false
+
+- name: Reload sshd
+  ansible.builtin.systemd:
+    name: sshd
+    state: reloaded
+
+- name: Wait for SSH to come back
+  ansible.builtin.wait_for_connection:
+    timeout: 600
+    delay: 5
+
+
+# Edit by ChatGPT
+- name: Canary SSH as {{ ADMINUSER }} after reload
+  become: false
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  ansible.builtin.shell: >
+    ssh -p {{ ADMINPORT | int }}
+    -o BatchMode=yes
+    -o ConnectTimeout=5
+    -o PreferredAuthentications=publickey
+    -o PasswordAuthentication=no
+    -o StrictHostKeyChecking=no
+    {% if SSH_IDENTITY_FILE is defined %}-i {{ SSH_IDENTITY_FILE }}{% endif %}
+    {{ ADMINUSER }}@{{ ansible_host | default(inventory_hostname) }} echo ok
+
+
+# Fail2ban
+- name: Install fail2ban
+  ansible.builtin.dnf:
+    name: fail2ban
+    state: present
+
+- name: Start and enable fail2ban
+  systemd:
+    name: fail2ban
+    enabled: true
+    state: started
+
+- name: Configure fail2ban jail.local
+  copy:
+    dest: /etc/fail2ban/jail.local
+    mode: '0644'
+    content: |
+      [DEFAULT]
+      ignoreip = 127.0.0.1/8 ::1 {{ LOCALIP | default('') }}
+      bantime  = 86400
+      findtime = 86400
+      destemail = {{ EMAIL }}
+      sender = fail2ban@mail.{{ DOMAIN }}
+      sendername = Fail2ban
+      mta = sendmail
+      action = %(action_mwl)s
+
+      [sshd]
+      enabled = true
+      port = 22,{{ ADMINPORT }}
+      filter = sshd
+      logpath = /var/log/secure
+      maxretry = 5
+  notify: Restart fail2ban
+
+- name: Whitelist my workstation in fail2ban (jail.d)
+  copy:
+    dest: /etc/fail2ban/jail.d/whitelist.local
+    content: |
+      [DEFAULT]
+      ignoreip = 127.0.0.1/8 ::1 {{ LOCALIP }}
+  notify: Restart fail2ban
+
+# --- Boot resilience for sshd + UFW (idempotent) ---
+
+# UFW: make sure it is enabled *and* starts early enough in the boot
+- name: Ensure UFW is enabled now and on boot
+  ansible.builtin.systemd:
+    name: ufw
+    enabled: true
+    state: started
+
+- name: "Order UFW before network-pre (avoid online-cycle)"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ufw.service.d/override.conf
+    mode: "0644"
+    content: |
+      [Unit]
+      Wants=network-pre.target
+      Before=network-pre.target
+
+- name: "Reload systemd and start UFW (oneshot)"
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: ufw
+    enabled: true
+    state: started
+
+# SELinux: ensure sshd port is labeled (requires community.general)
+- name: Install policycoreutils-python-utils (for semanage)
+  ansible.builtin.dnf:
+    name: policycoreutils-python-utils
+    state: present
+
+- name: Ensure sshd SELinux port is present
+  community.general.seport:
+    ports: "{{ ADMINPORT | int }}"
+    proto: tcp
+    setype: ssh_port_t
+    state: present
+
+# Avoid socket/service ambiguity for SSH
+- name: Stop and disable sshd.socket if present
+  ansible.builtin.systemd:
+    name: sshd.socket
+    state: stopped
+    enabled: false
+  failed_when: false
+
+# Harden sshd unit ordering and restart behaviour
+- name: Ensure sshd systemd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/sshd.service.d
+    state: directory
+    mode: "0755"
+
+- name: Order sshd after network-online and auto-restart
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/sshd.service.d/override.conf
+    mode: "0644"
+    content: |
+      [Unit]
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Restart=always
+      RestartSec=5s
+
+# On Alma/NetworkManager, ensure "network-online" actually waits
+- name: Enable NetworkManager-wait-online
+  ansible.builtin.systemd:
+    name: NetworkManager-wait-online.service
+    enabled: true
+    state: started
+
+# Sanity checks: host keys, config syntax, (re)enable + restart
+- name: Ensure SSH host keys exist
+  ansible.builtin.command: ssh-keygen -A
+  changed_when: false
+  failed_when: false
+
+- name: Validate sshd_config syntax
+  ansible.builtin.command: /usr/sbin/sshd -t -f /etc/ssh/sshd_config
+  changed_when: false
+
+- name: Reload systemd and (re)enable sshd
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: sshd
+    enabled: true
+    state: restarted
+
+# Prove sshd is actually listening on our admin port (server-side)
+- name: Confirm sshd is listening on ADMINPORT
+  ansible.builtin.shell: "ss -ltn | awk '$1==\"LISTEN\" && $4 ~ /:{{ ADMINPORT | int }}$/ {found=1} END{exit !found}'"
+  changed_when: false
+
+# Optional: from controller, verify we can reach the port (no become)
+- name: "Controller preflight: can reach SSH admin port"
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host | default(inventory_hostname) }}"
+    port: "{{ ADMINPORT | int }}"
+    state: started
+    delay: 0
+    timeout: 30
+  delegate_to: localhost
+  become: false
+
+- name: Tame UFW logging
+  command: ufw logging low
+  changed_when: false
+  failed_when: false
+
+- name: "Drop sysctl tunables"
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-custom.conf
+    mode: "0644"
+    content: |
+      net.ipv4.ip_forward = 1
+  notify: "apply-sysctl"
+
+- name: Validate SSH works for {{ ADMINUSER }} on admin port (no play user switch)
+  become: false
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  ansible.builtin.shell: >
+    ssh -p {{ ADMINPORT | int }}
+    -o BatchMode=yes
+    -o ConnectTimeout=5
+    -o PreferredAuthentications=publickey
+    -o PasswordAuthentication=no
+    -o StrictHostKeyChecking=no
+    {% if SSH_IDENTITY_FILE is defined %}-i {{ SSH_IDENTITY_FILE }}{% endif %}
+    {{ ADMINUSER }}@{{ ansible_host | default(inventory_hostname) }} echo ok

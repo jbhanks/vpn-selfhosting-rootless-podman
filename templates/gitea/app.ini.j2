@@ -1,0 +1,133 @@
+APP_NAME = Gitea
+RUN_MODE = prod
+RUN_USER = git
+WORK_PATH = /data/gitea
+
+[database]
+DB_TYPE  = postgres
+HOST     = {{ WG_SERVER_IP }}:{{ DBPORT }}
+NAME     = {{ GITEA_DB_NAME }}
+USER     = {{ GITEA_DB_USER }}
+PASSWD   = {{ GITEA_DB_PASS }}
+SSL_MODE = disable
+# SCHEMA   =
+
+[repository]
+ROOT = /data/git/repositories
+
+[server]
+DOMAIN           = {{ GITEA_HOST }}
+ROOT_URL         = https://{{ GITEA_HOST }}/
+PROTOCOL         = http
+HTTP_ADDR        = 0.0.0.0
+HTTP_PORT        = {{ GITEA_CONTAINER_PORT_HTTP }}
+
+SSH_DOMAIN       = {{ GITEA_HOST }}
+START_SSH_SERVER = true
+SSH_PORT         = {{ GITEA_HOST_PORT_SSH }}
+SSH_LISTEN_PORT  = {{ GITEA_CONTAINER_PORT_SSH }}
+
+OFFLINE_MODE     = false
+LFS_START_SERVER = true
+
+# LANDING_PAGE                 = home
+# ENABLE_GZIP                  = false
+# STATIC_ROOT_PATH             =
+# APP_DATA_PATH                = /data/gitea
+# STATIC_CACHE_TIME            = 6h
+# REVERSE_PROXY_LIMIT          = 1
+# REVERSE_PROXY_TRUSTED_PROXIES = 127.0.0.0/8,::1/128
+
+[service]
+DISABLE_REGISTRATION             = true
+SHOW_REGISTRATION_BUTTON         = false
+REQUIRE_SIGNIN_VIEW              = false
+REGISTER_EMAIL_CONFIRM           = false
+ENABLE_NOTIFY_MAIL               = false
+ALLOW_ONLY_EXTERNAL_REGISTRATION = false
+ENABLE_CAPTCHA                   = false
+DEFAULT_KEEP_EMAIL_PRIVATE       = true
+DEFAULT_ALLOW_CREATE_ORGANIZATION = true
+DEFAULT_ENABLE_TIMETRACKING      = true
+NO_REPLY_ADDRESS                 = noreply.{{ DOMAIN }}
+
+# ENABLE_BASIC_AUTHENTICATION = true
+# ENABLE_PASSWORD_SIGNIN_FORM = true
+# ENABLE_PASSKEY_AUTHENTICATION = true
+# SHOW_MILESTONES_DASHBOARD_PAGE = true
+# DEFAULT_USER_VISIBILITY = public
+# DEFAULT_ORG_VISIBILITY  = public
+
+[security]
+INSTALL_LOCK   = true
+SECRET_KEY     = {{ GITEA_SECRET_KEY }}
+INTERNAL_TOKEN = {{ GITEA_INTERNAL_TOKEN }}
+
+# LOGIN_REMEMBER_DAYS         = 31
+# COOKIE_REMEMBER_NAME        = gitea_incredible
+# DISABLE_GIT_HOOKS           = true
+# DISABLE_WEBHOOKS            = false
+# IMPORT_LOCAL_PATHS          = false
+# ONLY_ALLOW_PUSH_IF_GITEA_ENVIRONMENT_SET = true
+# DISABLE_QUERY_AUTH_TOKEN    = false
+
+[lfs]
+PATH = /data/git/lfs
+# STORAGE_TYPE       = local
+# LFS_HTTP_AUTH_EXPIRY = 24h
+# LFS_MAX_FILE_SIZE    = 0
+
+[mailer]
+ENABLED = false
+
+[openid]
+ENABLE_OPENID_SIGNIN = true
+ENABLE_OPENID_SIGNUP = false
+# WHITELISTED_URIS =
+# BLACKLISTED_URIS =
+
+[session]
+PROVIDER = db
+# PROVIDER_CONFIG =
+# COOKIE_SECURE   =
+# COOKIE_NAME     = i_like_gitea
+# SAME_SITE       = lax
+
+[picture]
+AVATAR_UPLOAD_PATH            = /data/gitea/avatars
+REPOSITORY_AVATAR_UPLOAD_PATH = /data/gitea/repo-avatars
+
+# GRAVATAR_SOURCE = gravatar
+# AVATAR_MAX_WIDTH = 4096
+# AVATAR_MAX_HEIGHT = 4096
+# AVATAR_MAX_FILE_SIZE = 1048576
+
+[attachment]
+PATH = /data/gitea/attachments
+# STORAGE_TYPE = local
+# MAX_SIZE     = 2048
+# MAX_FILES    = 5
+
+[log]
+MODE      = console
+LEVEL     = Info
+ROOT_PATH = /data/gitea/log
+# ENABLE_ACCESS_LOG = false
+# STACKTRACE_LEVEL  = None
+
+[oauth2]
+ENABLED = true
+# JWT_SIGNING_ALGORITHM       = RS256
+# JWT_SIGNING_PRIVATE_KEY_FILE = jwt/private.pem
+# JWT_SECRET                  = {{ GITEA_OAUTH2_JWT_SECRET }}
+# ACCESS_TOKEN_EXPIRATION_TIME = 3600
+# REFRESH_TOKEN_EXPIRATION_TIME = 730
+
+[api]
+# ENABLE_SWAGGER = true
+# MAX_RESPONSE_ITEMS = 50
+# DEFAULT_PAGING_NUM = 30
+
+[actions]
+ENABLED = true
+# DEFAULT_ACTIONS_URL = github

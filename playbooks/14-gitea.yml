@@ -1,0 +1,498 @@
+---
+###############################################################################
+# Gitea (rootless podman + quadlet, user-scoped) + nginx reverse proxy
+# Uses host PostgreSQL (no DB container)
+###############################################################################
+
+- name: "Gitea | Set base vars / defaults"
+  ansible.builtin.set_fact:
+    GITEA_HOST: "{{ GITEA_HOST | default('gitea.' ~ DOMAIN) }}"
+    GITEA_USER: "{{ GITEA_USER | default('gitea') }}"
+
+    # Host paths (base)
+    GITEA_ROOT: "{{ GITEA_ROOT | default('/opt/gitea') }}"
+    GITEA_ENV_DIR: "{{ GITEA_ENV_DIR | default('/etc/gitea') }}"
+    GITEA_ENV_FILE: "{{ GITEA_ENV_FILE | default('/etc/gitea/gitea.env') }}"
+
+    # Podman network
+    GITEA_NET_NAME: "{{ GITEA_NET_NAME | default('gitea_net') }}"
+
+    # Ports
+    GITEA_HOST_PORT_HTTP: "{{ GITEA_HOST_PORT_HTTP | default(3030) }}"
+    GITEA_CONTAINER_PORT_HTTP: "{{ GITEA_CONTAINER_PORT_HTTP | default(3000) }}"
+    GITEA_HOST_PORT_SSH: "{{ GITEA_HOST_PORT_SSH | default(2222) }}"
+    GITEA_CONTAINER_PORT_SSH: "{{ GITEA_CONTAINER_PORT_SSH | default(2222) }}"
+
+    # Image
+    GITEA_IMAGE: "{{ GITEA_IMAGE | default('docker.io/gitea/gitea:latest') }}"
+
+    # Postgres
+    GITEA_DB_NAME: "{{ GITEA_DB_NAME | default('gitea') }}"
+    GITEA_DB_USER: "{{ GITEA_DB_USER | default('gitea') }}"
+
+    # Template/config paths
+    GITEA_APP_INI_TEMPLATE: "{{ GITEA_APP_INI_TEMPLATE | default('templates/gitea/app.ini.j2') }}"
+
+- name: "Gitea | Set derived paths"
+  ansible.builtin.set_fact:
+    GITEA_DATA_DIR: "{{ GITEA_DATA_DIR | default(GITEA_ROOT ~ '/data') }}"
+    GITEA_QUADLET_DIR: "/home/{{ GITEA_USER }}/.config/containers/systemd"
+    GITEA_APP_INI_DEST: "{{ (GITEA_DATA_DIR | default(GITEA_ROOT ~ '/data')) ~ '/gitea/conf/app.ini' }}"
+
+- name: "Gitea | Set customization vars"
+  ansible.builtin.set_fact:
+    GITEA_CUSTOM_SRC_DIR: "{{ GITEA_CUSTOM_SRC_DIR | default('files/gitea_custom') }}"
+    GITEA_CUSTOM_DEST_DIR: "{{ GITEA_CUSTOM_DEST_DIR | default(GITEA_DATA_DIR ~ '/gitea') }}"
+
+- name: "Gitea | Validate required vars"
+  ansible.builtin.assert:
+    that:
+      - GITEA_DB_PASS is defined
+      - (GITEA_DB_PASS | string | length) > 0
+      - GITEA_SECRET_KEY is defined
+      - (GITEA_SECRET_KEY | string | length) > 0
+      - GITEA_INTERNAL_TOKEN is defined
+      - (GITEA_INTERNAL_TOKEN | string | length) > 0
+      - GITEA_ADMIN_USER is defined
+      - (GITEA_ADMIN_USER | string | length) > 0
+      - GITEA_ADMIN_PASS is defined
+      - (GITEA_ADMIN_PASS | string | length) > 0
+      - GITEA_ADMIN_EMAIL is defined
+      - (GITEA_ADMIN_EMAIL | string | length) > 0
+    fail_msg: "Missing one of: GITEA_DB_PASS, GITEA_SECRET_KEY, GITEA_INTERNAL_TOKEN, GITEA_ADMIN_USER, GITEA_ADMIN_PASS, GITEA_ADMIN_EMAIL"
+
+###############################################################################
+# User + dirs
+###############################################################################
+
+- name: "Gitea | Ensure custom tree root exists"
+  ansible.builtin.file:
+    path: "{{ GITEA_CUSTOM_DEST_DIR }}"
+    state: directory
+    owner: "{{ GITEA_USER }}"
+    group: "{{ GITEA_USER }}"
+    mode: "0755"
+
+- name: "Gitea | Copy custom Gitea tree"
+  ansible.builtin.copy:
+    src: "{{ GITEA_CUSTOM_SRC_DIR }}/"
+    dest: "{{ GITEA_CUSTOM_DEST_DIR }}/"
+    owner: "{{ GITEA_USER }}"
+    group: "{{ GITEA_USER }}"
+    mode: preserve
+    directory_mode: "0755"
+
+- name: "Gitea | Ensure persistent directories exist"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ GITEA_ROOT }}", owner: "root", group: "root", mode: "0755" }
+    - { path: "{{ GITEA_DATA_DIR }}", owner: "{{ GITEA_USER }}", group: "{{ GITEA_USER }}", mode: "0750" }
+    - { path: "{{ GITEA_DATA_DIR }}/gitea", owner: "{{ GITEA_USER }}", group: "{{ GITEA_USER }}", mode: "0755" }
+    - { path: "{{ GITEA_DATA_DIR }}/gitea/conf", owner: "{{ GITEA_USER }}", group: "{{ GITEA_USER }}", mode: "0755" }
+    - { path: "{{ GITEA_ENV_DIR }}", owner: "root", group: "root", mode: "0755" }
+    - { path: "{{ GITEA_QUADLET_DIR }}", owner: "{{ GITEA_USER }}", group: "{{ GITEA_USER }}", mode: "0750" }
+
+- name: "Gitea | Preflight: check podman is installed as {{ GITEA_USER }}"
+  ansible.builtin.command: "sudo -u {{ GITEA_USER }} podman --version"
+  args:
+    chdir: "/home/{{ GITEA_USER }}"
+  environment:
+    HOME: "/home/{{ GITEA_USER }}"
+  register: gitea_podman_version
+  changed_when: false
+
+###############################################################################
+# Runtime facts for root controlling rootless systemd
+###############################################################################
+
+- name: "Gitea | Derive runtime dir for user systemd"
+  block:
+    - name: "Gitea | Get UID of {{ GITEA_USER }}"
+      ansible.builtin.command: "id -u {{ GITEA_USER }}"
+      register: gitea_uid
+      changed_when: false
+
+    - name: "Gitea | Set runtime facts"
+      ansible.builtin.set_fact:
+        GITEA_UID: "{{ gitea_uid.stdout | trim }}"
+        GITEA_XDG_RUNTIME_DIR: "/run/user/{{ gitea_uid.stdout | trim }}"
+        GITEA_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ gitea_uid.stdout | trim }}/bus"
+
+    - name: "Gitea | Ensure XDG runtime dir exists"
+      ansible.builtin.file:
+        path: "{{ GITEA_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ GITEA_USER }}"
+        group: "{{ GITEA_USER }}"
+        mode: "0700"
+
+    - name: "Gitea | Ensure user manager is started"
+      ansible.builtin.systemd:
+        name: "user@{{ GITEA_UID }}.service"
+        state: started
+  become: true
+
+###############################################################################
+# Podman network
+###############################################################################
+
+- name: "Gitea | Ensure Podman network exists + capture subnet/iface/gateway"
+  block:
+    - name: "Gitea | Check network exists"
+      ansible.builtin.command: "sudo -u {{ GITEA_USER }} podman network exists {{ GITEA_NET_NAME }}"
+      args:
+        chdir: "/home/{{ GITEA_USER }}"
+      environment:
+        HOME: "/home/{{ GITEA_USER }}"
+        XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+      register: gitea_net_exists
+      changed_when: false
+      failed_when: false
+
+    - name: "Gitea | Create network if missing"
+      ansible.builtin.command: "sudo -u {{ GITEA_USER }} podman network create {{ GITEA_NET_NAME }}"
+      args:
+        chdir: "/home/{{ GITEA_USER }}"
+      environment:
+        HOME: "/home/{{ GITEA_USER }}"
+        XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+      when: gitea_net_exists.rc != 0
+
+    - name: "Gitea | Inspect network"
+      ansible.builtin.command: "sudo -u {{ GITEA_USER }} podman network inspect {{ GITEA_NET_NAME }}"
+      args:
+        chdir: "/home/{{ GITEA_USER }}"
+      environment:
+        HOME: "/home/{{ GITEA_USER }}"
+        XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+      register: gitea_net_inspect
+      changed_when: false
+
+    - name: "Gitea | Parse network facts"
+      ansible.builtin.set_fact:
+        GITEA_NET_JSON: "{{ gitea_net_inspect.stdout | from_json }}"
+        GITEA_DNS_GATEWAY: "{{ (gitea_net_inspect.stdout | from_json)[0].subnets[0].gateway }}"
+        GITEA_PODMAN_IFACE: "{{ (gitea_net_inspect.stdout | from_json)[0].network_interface }}"
+        GITEA_PODMAN_SUBNET: "{{ (gitea_net_inspect.stdout | from_json)[0].subnets[0].subnet }}"
+
+###############################################################################
+# Host Postgres
+###############################################################################
+
+- name: "Gitea | Postgres: allow Podman subnet in pg_hba.conf"
+  block:
+    - name: "Gitea | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: gitea_hba_file
+      changed_when: false
+
+    - name: "Gitea | Postgres: allow podman subnet"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ gitea_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ GITEA_DB_NAME }}"
+        users: "{{ GITEA_DB_USER }}"
+        source: "{{ GITEA_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+
+    - name: "Gitea | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+- name: "Gitea | Postgres: ensure role exists"
+  community.postgresql.postgresql_user:
+    login_host: "127.0.0.1"
+    login_port: "{{ DBPORT | int }}"
+    login_user: postgres
+    login_password: "{{ DBSUPERPASS }}"
+    name: "{{ GITEA_DB_USER }}"
+    password: "{{ GITEA_DB_PASS }}"
+    encrypted: true
+    state: present
+
+- name: "Gitea | Postgres: ensure database exists"
+  community.postgresql.postgresql_db:
+    login_host: "127.0.0.1"
+    login_port: "{{ DBPORT | int }}"
+    login_user: postgres
+    login_password: "{{ DBSUPERPASS }}"
+    maintenance_db: postgres
+    name: "{{ GITEA_DB_NAME }}"
+    owner: "{{ GITEA_DB_USER }}"
+    encoding: "UTF8"
+    state: present
+
+###############################################################################
+# Gitea env/config
+###############################################################################
+
+- name: "Gitea | Write env file"
+  ansible.builtin.copy:
+    dest: "{{ GITEA_ENV_FILE }}"
+    owner: root
+    group: "{{ GITEA_USER }}"
+    mode: "0640"
+    content: |
+      USER_UID=1000
+      USER_GID=1000
+
+- name: "Gitea | Render app.ini"
+  ansible.builtin.template:
+    src: "{{ GITEA_APP_INI_TEMPLATE }}"
+    dest: "{{ GITEA_APP_INI_DEST }}"
+    owner: "{{ GITEA_USER }}"
+    group: "{{ GITEA_USER }}"
+    mode: "0640"
+
+###############################################################################
+# Quadlets
+###############################################################################
+
+- name: "Gitea | Data dir: check ownership in container userns"
+  become: true
+  become_user: "{{ GITEA_USER }}"
+  ansible.builtin.command: >-
+    podman unshare stat -c '%u:%g' {{ GITEA_DATA_DIR }}
+  environment:
+    HOME: "/home/{{ GITEA_USER }}"
+    XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GITEA_DBUS_SESSION_BUS_ADDRESS }}"
+  register: gitea_data_ids
+  changed_when: false
+
+- name: "Gitea | Data dir: podman unshare chown to 1000:1000 if needed"
+  become: true
+  become_user: "{{ GITEA_USER }}"
+  ansible.builtin.command: >-
+    podman unshare chown -R 1000:1000 {{ GITEA_DATA_DIR }}
+  environment:
+    HOME: "/home/{{ GITEA_USER }}"
+    XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GITEA_DBUS_SESSION_BUS_ADDRESS }}"
+  when: (gitea_data_ids.stdout | trim) != '1000:1000'
+
+- name: "Gitea | Write Quadlet pod file"
+  ansible.builtin.copy:
+    dest: "{{ GITEA_QUADLET_DIR }}/gitea.pod"
+    owner: "{{ GITEA_USER }}"
+    group: "{{ GITEA_USER }}"
+    mode: "0644"
+    content: |
+      [Pod]
+      PodName=gitea
+      Network={{ GITEA_NET_NAME }}
+      AddHost=host.containers.internal:host-gateway
+
+      PublishPort=127.0.0.1:{{ GITEA_HOST_PORT_HTTP }}:{{ GITEA_CONTAINER_PORT_HTTP }}
+      PublishPort=127.0.0.1:{{ GITEA_HOST_PORT_SSH }}:{{ GITEA_CONTAINER_PORT_SSH }}
+
+- name: "Gitea | Write Quadlet container file"
+  ansible.builtin.copy:
+    dest: "{{ GITEA_QUADLET_DIR }}/gitea.container"
+    owner: "{{ GITEA_USER }}"
+    group: "{{ GITEA_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=gitea
+      Image={{ GITEA_IMAGE }}
+      Pod=gitea.pod
+      EnvironmentFile={{ GITEA_ENV_FILE }}
+
+      Volume={{ GITEA_DATA_DIR }}:/data:Z
+
+      [Service]
+      Restart=always
+
+- name: "Gitea | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ GITEA_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GITEA_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+- name: "Gitea | Start services"
+  block:
+    - name: "Gitea | Start pod"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ GITEA_USER }}@.host --user
+          start gitea-pod.service
+      changed_when: false
+
+    - name: "Gitea | Start container"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ GITEA_USER }}@.host --user
+          start gitea.service
+      changed_when: false
+
+###############################################################################
+# nginx vhost
+###############################################################################
+
+- name: "Gitea | Install nginx vhost"
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ GITEA_HOST }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ GITEA_HOST }};
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen {{ WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ GITEA_HOST }};
+
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log  /var/log/nginx/{{ GITEA_HOST }}_access.log  main;
+          error_log   /var/log/nginx/{{ GITEA_HOST }}_error.log warn;
+
+          client_max_body_size 0;
+          underscores_in_headers on;
+
+          location / {
+              proxy_pass http://127.0.0.1:{{ GITEA_HOST_PORT_HTTP }}/;
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+      }
+
+- name: "Gitea | Reload nginx"
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded
+
+###############################################################################
+# Readiness + initialization
+###############################################################################
+
+- name: "Gitea | Wait for local web UI to respond"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ GITEA_HOST_PORT_HTTP }}/"
+    method: GET
+    status_code:
+      - 200
+      - 302
+      - 303
+    return_content: false
+  register: gitea_wait
+  retries: 30
+  delay: 3
+  until: gitea_wait.status in [200, 302, 303]
+
+- name: "Gitea | Wait for admin CLI to be usable"
+  become: true
+  become_user: "{{ GITEA_USER }}"
+  ansible.builtin.command:
+    argv:
+      - podman
+      - exec
+      - --user
+      - "1000:1000"
+      - gitea
+      - /usr/local/bin/gitea
+      - --config
+      - /data/gitea/conf/app.ini
+      - admin
+      - user
+      - list
+  environment:
+    HOME: "/home/{{ GITEA_USER }}"
+    XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GITEA_DBUS_SESSION_BUS_ADDRESS }}"
+  register: gitea_admin_cli_ready
+  changed_when: false
+  retries: 30
+  delay: 3
+  until: gitea_admin_cli_ready.rc == 0
+
+- name: "Gitea | Check whether admin user already exists"
+  become: true
+  become_user: "{{ GITEA_USER }}"
+  ansible.builtin.command:
+    argv:
+      - podman
+      - exec
+      - --user
+      - "1000:1000"
+      - gitea
+      - /usr/local/bin/gitea
+      - --config
+      - /data/gitea/conf/app.ini
+      - admin
+      - user
+      - list
+  environment:
+    HOME: "/home/{{ GITEA_USER }}"
+    XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GITEA_DBUS_SESSION_BUS_ADDRESS }}"
+  register: gitea_user_list
+  changed_when: false
+
+- name: "Gitea | Create initial admin user if missing"
+  become: true
+  become_user: "{{ GITEA_USER }}"
+  ansible.builtin.command:
+    argv:
+      - podman
+      - exec
+      - --user
+      - "1000:1000"
+      - gitea
+      - /usr/local/bin/gitea
+      - --config
+      - /data/gitea/conf/app.ini
+      - admin
+      - user
+      - create
+      - --username
+      - "{{ GITEA_ADMIN_USER }}"
+      - --password
+      - "{{ GITEA_ADMIN_PASS }}"
+      - --email
+      - "{{ GITEA_ADMIN_EMAIL }}"
+      - --admin
+      - --must-change-password=false
+  environment:
+    HOME: "/home/{{ GITEA_USER }}"
+    XDG_RUNTIME_DIR: "{{ GITEA_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GITEA_DBUS_SESSION_BUS_ADDRESS }}"
+  register: gitea_admin_create
+  changed_when: true
+  when: gitea_user_list.stdout is not regex('(^|\\s)'+ (GITEA_ADMIN_USER | regex_escape) + '(\\s|$)')
+
+- name: "Gitea | Report admin creation result"
+  ansible.builtin.debug:
+    msg: >-
+      Admin user {{ GITEA_ADMIN_USER }} already existed; no creation was needed.
+  when: gitea_user_list.stdout is regex('(^|\\s)'+ (GITEA_ADMIN_USER | regex_escape) + '(\\s|$)')

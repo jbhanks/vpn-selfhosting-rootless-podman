@@ -1,0 +1,363 @@
+---
+- name: "Koillection | Set base vars / defaults"
+  ansible.builtin.set_fact:
+    KOILLECTION_USER: "{{ KOILLECTION_USER | default('koillection') }}"
+    KOILLECTION_GROUP: "{{ KOILLECTION_GROUP | default('koillection') }}"
+
+    KOILLECTION_ROOT: "{{ KOILLECTION_ROOT | default('/opt/koillection') }}"
+    KOILLECTION_ENV_DIR: "{{ KOILLECTION_ENV_DIR | default('/etc/koillection') }}"
+    KOILLECTION_UPLOADS_DIR: "{{ KOILLECTION_UPLOADS_DIR | default(KOILLECTION_ROOT ~ '/uploads') }}"
+
+    KOILLECTION_QUADLET_DIR: "{{ KOILLECTION_QUADLET_DIR | default('/home/' ~ KOILLECTION_USER ~ '/.config/containers/systemd') }}"
+    KOILLECTION_CONTAINER_NAME: "{{ KOILLECTION_CONTAINER_NAME | default('koillection') }}"
+    KOILLECTION_IMAGE: "{{ KOILLECTION_IMAGE | default('docker.io/koillection/koillection:latest') }}"
+
+    KOILLECTION_PORT: "{{ KOILLECTION_PORT | default('8088') }}"
+    KOILLECTION_HOSTNAME: "{{ KOILLECTION_HOSTNAME | default('koillection.' ~ DOMAIN) }}"
+
+    KOILLECTION_DB_DRIVER: "{{ KOILLECTION_DB_DRIVER | default('pdo_pgsql') }}"
+    KOILLECTION_DB_HOST: "{{ KOILLECTION_DB_HOST | default('host.containers.internal') }}"
+    KOILLECTION_DB_PORT: "{{ KOILLECTION_DB_PORT | default(DBPORT) }}"
+    KOILLECTION_DB_NAME: "{{ KOILLECTION_DB_NAME | default('koillection') }}"
+    KOILLECTION_DB_USER: "{{ KOILLECTION_DB_USER | default('koillection') }}"
+    KOILLECTION_DB_PASSWORD: "{{ KOILLECTION_DB_PASSWORD | default('change_me!') }}"
+    KOILLECTION_DB_VERSION: "{{ KOILLECTION_DB_VERSION | default('16') }}"
+
+    KOILLECTION_APP_ENV: "{{ KOILLECTION_APP_ENV | default('prod') }}"
+    KOILLECTION_APP_DEBUG: "{{ KOILLECTION_APP_DEBUG | default('0') }}"
+    KOILLECTION_HTTPS_ENABLED: "{{ KOILLECTION_HTTPS_ENABLED | default('1') }}"
+    KOILLECTION_PHP_TZ: "{{ KOILLECTION_PHP_TZ | default('America/New_York') }}"
+    KOILLECTION_UPLOAD_MAX_FILESIZE: "{{ KOILLECTION_UPLOAD_MAX_FILESIZE | default('20M') }}"
+    KOILLECTION_PHP_MEMORY_LIMIT: "{{ KOILLECTION_PHP_MEMORY_LIMIT | default('512M') }}"
+
+    KOILLECTION_SYMFONY_TRUSTED_PROXIES: "{{ KOILLECTION_SYMFONY_TRUSTED_PROXIES | default('private_ranges') }}"
+    KOILLECTION_SYMFONY_TRUSTED_HEADERS: "{{ KOILLECTION_SYMFONY_TRUSTED_HEADERS | default('forwarded,x-forwarded-for,x-forwarded-host,x-forwarded-proto,x-forwarded-port,x-forwarded-prefix') }}"
+
+- name: "Koillection | Set derived vars (depend on other facts)"
+  ansible.builtin.set_fact:
+    KOILLECTION_ENV_FILE: "{{ KOILLECTION_ENV_FILE | default(KOILLECTION_ENV_DIR ~ '/koillection.env') }}"
+
+- name: "Koillection | Ensure service user exists"
+  ansible.builtin.user:
+    name: "{{ KOILLECTION_USER }}"
+    group: "{{ KOILLECTION_GROUP }}"
+    create_home: true
+    shell: /bin/bash
+    state: present
+
+# - name: "Koillection | Enable linger for user (rootless systemd)"
+#   ansible.builtin.command: "loginctl enable-linger {{ KOILLECTION_USER }}"
+#   changed_when: false
+
+- name: "Koillection | Ensure directories exist"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ KOILLECTION_ROOT }}",        owner: "root",            group: "root",            mode: "0755" }
+    - { path: "{{ KOILLECTION_UPLOADS_DIR }}", owner: "{{ KOILLECTION_USER }}", group: "{{ KOILLECTION_GROUP }}", mode: "0750" }
+    - { path: "{{ KOILLECTION_ENV_DIR }}",     owner: "root",            group: "{{ KOILLECTION_GROUP }}", mode: "0750" }
+
+- name: "Koillection | Postgres: allow access in pg_hba.conf"
+  block:
+    - name: "Koillection | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: koillection_hba_file
+      changed_when: false
+
+    # Allow rootless containers coming from podman subnet (recommended if you know it / already track it)
+    - name: "Koillection | Postgres: allow podman subnet (koillection -> koillection)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ koillection_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ KOILLECTION_DB_NAME }}"
+        users: "{{ KOILLECTION_DB_USER }}"
+        source: "{{ KOILLECTION_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: KOILLECTION_PODMAN_SUBNET is defined
+
+    - name: "Koillection | Postgres: allow podman subnet (postgres -> koillection db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ koillection_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ KOILLECTION_DB_NAME }}"
+        users: postgres
+        source: "{{ KOILLECTION_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: KOILLECTION_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your AppFlowy insert)
+    - name: "Koillection | Postgres: allow samehost (koillection -> koillection)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ koillection_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ KOILLECTION_DB_NAME }}"
+        users: "{{ KOILLECTION_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Koillection | Postgres: allow samehost (postgres -> koillection db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ koillection_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ KOILLECTION_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Koillection | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+- name: "Koillection | Postgres: create role + database (host Postgres, TCP auth)"
+  become: true
+  become_user: postgres
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ KOILLECTION_DB_USER }}') THEN
+        CREATE ROLE "{{ KOILLECTION_DB_USER }}" LOGIN PASSWORD '{{ KOILLECTION_DB_PASSWORD }}';
+      END IF;
+    END $$;
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '{{ KOILLECTION_DB_NAME }}') THEN
+        CREATE DATABASE "{{ KOILLECTION_DB_NAME }}" OWNER "{{ KOILLECTION_DB_USER }}";
+      END IF;
+    END $$;
+    SQL
+  args:
+    executable: /bin/bash
+  environment:
+    PGPASSWORD: "{{ DBSUPERPASS }}"
+  changed_when: false
+
+
+- name: "Koillection | Write env file"
+  ansible.builtin.copy:
+    dest: "{{ KOILLECTION_ENV_FILE }}"
+    owner: root
+    group: "{{ KOILLECTION_GROUP }}"
+    mode: "0640"
+    content: |
+      ########################################################################################################
+      # WEB
+      ########################################################################################################
+      APP_ENV={{ KOILLECTION_APP_ENV }}
+      APP_DEBUG={{ KOILLECTION_APP_DEBUG }}
+      HTTPS_ENABLED={{ KOILLECTION_HTTPS_ENABLED }}
+      UPLOAD_MAX_FILESIZE={{ KOILLECTION_UPLOAD_MAX_FILESIZE }}
+      PHP_MEMORY_LIMIT={{ KOILLECTION_PHP_MEMORY_LIMIT }}
+      PHP_TZ={{ KOILLECTION_PHP_TZ }}
+
+      SYMFONY_TRUSTED_PROXIES={{ KOILLECTION_SYMFONY_TRUSTED_PROXIES }}
+      SYMFONY_TRUSTED_HEADERS={{ KOILLECTION_SYMFONY_TRUSTED_HEADERS }}
+
+      ########################################################################################################
+      # DATABASE
+      ########################################################################################################
+      DB_DRIVER={{ KOILLECTION_DB_DRIVER }}
+      DB_NAME={{ KOILLECTION_DB_NAME }}
+      DB_HOST={{ KOILLECTION_DB_HOST }}
+      DB_PORT={{ KOILLECTION_DB_PORT }}
+      DB_USER={{ KOILLECTION_DB_USER }}
+      DB_PASSWORD={{ KOILLECTION_DB_PASSWORD }}
+      DB_VERSION={{ KOILLECTION_DB_VERSION }}
+
+- name: "Koillection | Ensure quadlet directory exists"
+  ansible.builtin.file:
+    path: "{{ KOILLECTION_QUADLET_DIR }}"
+    state: directory
+    owner: "{{ KOILLECTION_USER }}"
+    group: "{{ KOILLECTION_GROUP }}"
+    mode: "0755"
+
+- name: "Koillection | Install quadlet (container unit)"
+  ansible.builtin.copy:
+    dest: "{{ KOILLECTION_QUADLET_DIR }}/{{ KOILLECTION_CONTAINER_NAME }}.container"
+    owner: "{{ KOILLECTION_USER }}"
+    group: "{{ KOILLECTION_GROUP }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Koillection (rootless podman)
+      Wants=network-online.target
+      After=network-online.target
+
+      [Container]
+      Image={{ KOILLECTION_IMAGE }}
+      ContainerName={{ KOILLECTION_CONTAINER_NAME }}
+
+      # Publish only to loopback; nginx will reverse-proxy
+      PublishPort=127.0.0.1:{{ KOILLECTION_PORT }}:80
+
+      # Koillection uploads persistence
+      Volume={{ KOILLECTION_UPLOADS_DIR }}:/uploads:Z
+
+      # Load configuration
+      EnvironmentFile={{ KOILLECTION_ENV_FILE }}
+
+      # (Optional) If you have SELinux enforcing + hit AVCs, we can add label tweaks, but start here.
+
+      [Service]
+      Restart=always
+      TimeoutStartSec=120
+
+      [Install]
+      WantedBy=default.target
+
+- name: "Koillection | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+    - name: "Koillection | Get UID of {{ KOILLECTION_USER }}"
+      ansible.builtin.command: "id -u {{ KOILLECTION_USER }}"
+      register: koillection_uid
+      changed_when: false
+
+    - name: "Koillection | Set runtime facts"
+      ansible.builtin.set_fact:
+        KOILLECTION_UID: "{{ koillection_uid.stdout | trim }}"
+        KOILLECTION_XDG_RUNTIME_DIR: "/run/user/{{ koillection_uid.stdout | trim }}"
+        KOILLECTION_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ koillection_uid.stdout | trim }}/bus"
+
+    - name: "Koillection | Ensure XDG runtime dir exists"
+      ansible.builtin.file:
+        path: "{{ KOILLECTION_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ KOILLECTION_USER }}"
+        group: "{{ KOILLECTION_USER }}"
+        mode: "0700"
+
+    - name: "Koillection | Ensure user manager is started (user@UID)"
+      ansible.builtin.systemd:
+        name: "user@{{ KOILLECTION_UID }}.service"
+        state: started
+  become: true
+
+
+- name: "Koillection | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ KOILLECTION_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ KOILLECTION_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ KOILLECTION_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+- name: "Koillection | Start container service (generated; do not enable)"
+  block:
+    - name: "Koillection | Start container service"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ KOILLECTION_USER }}@.host --user
+          start {{ KOILLECTION_CONTAINER_NAME }}.service
+      changed_when: false
+
+  rescue:
+    - name: "Koillection | Status (for debugging)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ KOILLECTION_USER }}@.host
+          status {{ KOILLECTION_CONTAINER_NAME }}.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: koillection_status
+
+    - name: "Koillection | Journal (for debugging)"
+      ansible.builtin.command:
+        cmd: >-
+          journalctl --user -M {{ KOILLECTION_USER }}@.host
+          -xeu {{ KOILLECTION_CONTAINER_NAME }}.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: koillection_journal
+
+    - name: "Koillection | Show status"
+      ansible.builtin.debug:
+        var: koillection_status.stdout_lines
+
+    - name: "Koillection | Show journal"
+      ansible.builtin.debug:
+        var: koillection_journal.stdout_lines
+
+    - name: "Koillection | Fail after diagnostics"
+      ansible.builtin.fail:
+        msg: "Koillection service failed to start; see debug output above."
+
+- name: "Koillection | Start pod service (generated; do not enable)"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --machine={{ KOILLECTION_USER }}@.host --user
+      start {{ KOILLECTION_CONTAINER_NAME }}-pod.service
+  changed_when: false
+  failed_when: false
+
+- name: "Koillection | Nginx vhost (reverse proxy)"
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ KOILLECTION_HOSTNAME }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          listen [::]:80;
+          server_name {{ KOILLECTION_HOSTNAME }};
+
+          # If your earlier tasks already manage HTTP->HTTPS redirection globally, remove this server block.
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+              listen {{ WG_SERVER_IP }}:443 ssl;
+              http2 on;
+          server_name {{ KOILLECTION_HOSTNAME }};
+
+          # Your existing pattern (from earlier tasks) likely includes SSL params here:
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log  /var/log/nginx/{{ KOILLECTION_HOSTNAME }}_access.log  main;
+          error_log   /var/log/nginx/{{ KOILLECTION_HOSTNAME }}_error.log;
+
+          location / {
+              proxy_pass http://127.0.0.1:{{ KOILLECTION_PORT }};
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-Port $server_port;
+
+              proxy_redirect off;
+              proxy_read_timeout 300;
+              proxy_send_timeout 300;
+          }
+      }
+
+- name: "Koillection | nginx reload"
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

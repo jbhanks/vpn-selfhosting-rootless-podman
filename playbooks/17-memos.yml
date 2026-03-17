@@ -1,0 +1,347 @@
+---
+- name: "Memos | Set derived vars / defaults"
+  ansible.builtin.set_fact:
+    MEMOS_NET_NAME: "{{ MEMOS_NET_NAME | default('memos_net') }}"
+    MEMOS_POD_NAME: "{{ MEMOS_POD_NAME | default('memos') }}"
+    MEMOS_ROOT: "{{ MEMOS_ROOT | default('/opt/memos') }}"
+    MEMOS_ENV_DIR: "{{ MEMOS_ENV_DIR | default('/etc/memos') }}"
+    MEMOS_USER: "{{ MEMOS_USER | default('memos') }}"
+    MEMOS_QUADLET_DIR: "{{ MEMOS_QUADLET_DIR | default('/home/' ~ (MEMOS_USER | default('memos')) ~ '/.config/containers/systemd') }}"
+
+    # Container/image defaults
+    MEMOS_IMAGE: "ghcr.io/usememos/memos:stable"
+    MEMOS_CONTAINER_NAME: "{{ MEMOS_CONTAINER_NAME | default('memos') }}"
+
+    # App listen (container) and host bind (localhost only; nginx will proxy)
+    MEMOS_CONTAINER_PORT: "{{ MEMOS_CONTAINER_PORT | default('5230') }}"
+    MEMOS_BIND_IP: "{{ MEMOS_BIND_IP | default('127.0.0.1') }}"
+    MEMOS_HOST_PORT: "{{ MEMOS_HOST_PORT | default('5230') }}"
+
+    # Data dir (mounted into container)
+    MEMOS_DATA_DIR: "{{ MEMOS_DATA_DIR | default(MEMOS_ROOT ~ '/data') }}"
+
+    # Reverse proxy
+    MEMOS_SERVER_NAME: "{{ MEMOS_SERVER_NAME | default('memos.' ~ DOMAIN) }}"
+
+- name: "Memos | More derived vars / defaults"
+  ansible.builtin.set_fact:
+    MEMOS_ENV_FILE: "{{ MEMOS_ENV_FILE | default(MEMOS_ENV_DIR ~ '/memos.env') }}"
+    MEMOS_NGINX_CONF_PATH: "{{ MEMOS_NGINX_CONF_PATH | default('/etc/nginx/conf.d/' ~ MEMOS_SERVER_NAME ~ '.conf') }}"
+
+- name: "Memos | Ensure service user exists"
+  ansible.builtin.user:
+    name: "{{ MEMOS_USER }}"
+    system: true
+    create_home: true
+    shell: /sbin/nologin
+
+- name: "Memos | Ensure directories exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ MEMOS_USER }}"
+    group: "{{ MEMOS_USER }}"
+    mode: "0750"
+  loop:
+    - "{{ MEMOS_ROOT }}"
+    - "{{ MEMOS_DATA_DIR }}"
+
+- name: "Memos | Ensure env dir exists"
+  ansible.builtin.file:
+    path: "{{ MEMOS_ENV_DIR }}"
+    state: directory
+    owner: root
+    group: "{{ MEMOS_USER }}"
+    mode: "0750"
+
+- name: "Memos | Get UID of {{ MEMOS_USER }}"
+  ansible.builtin.command: "id -u {{ MEMOS_USER }}"
+  register: memos_uid
+  changed_when: false
+  become: true
+
+- name: "Memos | Set runtime facts"
+  ansible.builtin.set_fact:
+    MEMOS_UID: "{{ memos_uid.stdout | trim }}"
+    MEMOS_XDG_RUNTIME_DIR: "/run/user/{{ memos_uid.stdout | trim }}"
+    MEMOS_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ memos_uid.stdout | trim }}/bus"
+
+###############################################################################
+# Memos | Postgres: allow access + create role/db (host Postgres)
+###############################################################################
+
+- name: "Memos | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "Memos | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: memos_hba_file
+      changed_when: false
+
+    # Rootless podman often presents to the host as 169.254.x.x (pasta/slirp).
+    # This is the “pod” you actually need to allow for many rootless setups.
+    - name: "Memos | Postgres: allow rootless podman link-local (memos -> memos)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ memos_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ MEMOS_DB_NAME }}"
+        users: "{{ MEMOS_DB_USER }}"
+        source: "{{ MEMOS_PODMAN_LINKLOCAL_SUBNET | default('169.254.0.0/16') }}"
+        method: scram-sha-256
+        state: present
+
+    - name: "Memos | Postgres: allow rootless podman link-local (postgres -> memos db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ memos_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ MEMOS_DB_NAME }}"
+        users: postgres
+        source: "{{ MEMOS_PODMAN_LINKLOCAL_SUBNET | default('169.254.0.0/16') }}"
+        method: scram-sha-256
+        state: present
+
+    # Optional: if *you* track a podman subnet (some of your other stacks do)
+    - name: "Memos | Postgres: allow podman subnet (memos -> memos)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ memos_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ MEMOS_DB_NAME }}"
+        users: "{{ MEMOS_DB_USER }}"
+        source: "{{ MEMOS_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: MEMOS_PODMAN_SUBNET is defined
+
+    - name: "Memos | Postgres: allow podman subnet (postgres -> memos db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ memos_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ MEMOS_DB_NAME }}"
+        users: postgres
+        source: "{{ MEMOS_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: MEMOS_PODMAN_SUBNET is defined
+
+    # Keep your “samehost” pattern too (harmless, sometimes helpful)
+    - name: "Memos | Postgres: allow samehost (memos -> memos)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ memos_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ MEMOS_DB_NAME }}"
+        users: "{{ MEMOS_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Memos | Postgres: allow samehost (postgres -> memos db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ memos_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ MEMOS_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Memos | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "Memos | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ MEMOS_DB_USER }}"
+        password: "{{ MEMOS_DB_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "Memos | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ MEMOS_DB_NAME }}"
+        owner: "{{ MEMOS_DB_USER }}"
+        state: present
+
+- name: "Memos | Write env file (includes Postgres DSN)"
+  ansible.builtin.copy:
+    dest: "{{ MEMOS_ENV_FILE }}"
+    owner: root
+    group: "{{ MEMOS_USER }}"
+    mode: "0640"
+    content: |
+      # Memos config
+      MEMOS_DRIVER=postgres
+      MEMOS_DSN={{ MEMOS_DSN }}
+
+      # Optional (uncomment if you want to force a different listen port inside container)
+      # MEMOS_PORT={{ MEMOS_CONTAINER_PORT }}
+
+      # You can add other MEMOS_* settings here as needed.
+
+- name: "Memos | Debug: show env file perms"
+  ansible.builtin.command: "ls -la {{ MEMOS_ENV_DIR }} {{ MEMOS_ENV_FILE }}"
+  become: true
+  changed_when: false
+
+- name: "Memos | Ensure quadlet dir exists"
+  ansible.builtin.file:
+    path: "{{ MEMOS_QUADLET_DIR }}"
+    state: directory
+    owner: "{{ MEMOS_USER }}"
+    group: "{{ MEMOS_USER }}"
+    mode: "0755"
+
+- name: "Memos | Install quadlet container unit"
+  ansible.builtin.copy:
+    dest: "{{ MEMOS_QUADLET_DIR }}/{{ MEMOS_CONTAINER_NAME }}.container"
+    owner: "{{ MEMOS_USER }}"
+    group: "{{ MEMOS_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Memos (rootless Podman)
+      Wants=network-online.target
+      After=network-online.target
+
+      [Container]
+      Image={{ MEMOS_IMAGE }}
+      ContainerName={{ MEMOS_CONTAINER_NAME }}
+
+      # Bind only on localhost; nginx will proxy from the public vhost
+      PublishPort={{ MEMOS_BIND_IP }}:{{ MEMOS_HOST_PORT }}:{{ MEMOS_CONTAINER_PORT }}
+
+      Volume={{ MEMOS_DATA_DIR }}:/var/opt/memos:Z
+
+      EnvironmentFile={{ MEMOS_ENV_FILE }}
+
+      # Reasonable defaults
+      Pull=missing
+      AutoUpdate=registry
+
+      [Service]
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=default.target
+
+- name: "Memos | systemd --user daemon-reload (via machine context)"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --user -M {{ MEMOS_USER }}@.host daemon-reload
+  become: true
+  changed_when: false
+
+- name: "Memos | Show podman stderr"
+  ansible.builtin.debug:
+    var: memos_podman_debug.stderr_lines
+  when: memos_podman_debug is defined
+
+- name: "Memos | Start container service (generated; do not enable)"
+  block:
+    - name: "Memos | Start container service"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ MEMOS_USER }}@.host --user
+          start {{ MEMOS_CONTAINER_NAME }}.service
+      changed_when: false
+
+  rescue:
+    - name: "Memos | Status (for debugging)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ MEMOS_USER }}@.host
+          status {{ MEMOS_CONTAINER_NAME }}.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: memos_status
+
+    - name: "Memos | Journal (for debugging)"
+      ansible.builtin.command:
+        cmd: >-
+          journalctl --user -M {{ MEMOS_USER }}@.host
+          -xeu {{ MEMOS_CONTAINER_NAME }}.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: memos_journal
+
+    - name: "Memos | Show status"
+      ansible.builtin.debug:
+        var: memos_status.stdout_lines
+
+    - name: "Memos | Show journal"
+      ansible.builtin.debug:
+        var: memos_journal.stdout_lines
+
+    - name: "Memos | Fail after diagnostics"
+      ansible.builtin.fail:
+        msg: "Memos service failed to start; see debug output above."
+
+- name: "Memos | Start pod service (generated; do not enable)"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --machine={{ MEMOS_USER }}@.host --user
+      start {{ MEMOS_CONTAINER_NAME }}-pod.service
+  changed_when: false
+  failed_when: false
+
+- name: "Memos | Nginx reverse proxy vhost"
+  ansible.builtin.copy:
+    dest: "{{ MEMOS_NGINX_CONF_PATH }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Redirect http to https
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ MEMOS_SERVER_NAME }};
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen {{  WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ MEMOS_SERVER_NAME }};
+
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log /var/log/nginx/{{ MEMOS_SERVER_NAME }}_access.log main;
+          error_log  /var/log/nginx/{{ MEMOS_SERVER_NAME }}_error.log warn;
+
+          location / {
+              proxy_pass http://127.0.0.1:5230/;
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              proxy_read_timeout 300s;
+              proxy_send_timeout 300s;
+          }
+      }
+
+- name: "Memos | Reload nginx"
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

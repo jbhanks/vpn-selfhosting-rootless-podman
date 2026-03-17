@@ -1,0 +1,330 @@
+---
+#########################
+######### Initial setup ##########
+###########################
+- name: Set timezone
+  command: timedatectl set-timezone America/New_York
+
+# Idempotent swapfile setup  — Edit by ChatGPT
+- name: Check if /swapfile exists  # Edit by ChatGPT
+  ansible.builtin.stat:
+    path: /swapfile
+  register: swapfile_stat  # Edit by ChatGPT
+
+- name: Allocate swapfile if missing (4G)  # Edit by ChatGPT
+  ansible.builtin.command:
+    cmd: fallocate -l 4G /swapfile
+    creates: /swapfile
+  when: not swapfile_stat.stat.exists  # Edit by ChatGPT
+
+- name: Set swapfile permissions (0600)  # Edit by ChatGPT
+  ansible.builtin.file:
+    path: /swapfile
+    mode: '0600'
+
+- name: Detect existing swap signature on /swapfile  # Edit by ChatGPT
+  ansible.builtin.command:
+    cmd: blkid -p -s TYPE -o value /swapfile
+  register: swapfile_type  # Edit by ChatGPT
+  changed_when: false  # Edit by ChatGPT
+  failed_when: false   # Edit by ChatGPT
+
+- name: Initialize swap area (mkswap) if signature missing  # Edit by ChatGPT
+  ansible.builtin.command: mkswap /swapfile
+  when: swapfile_type.stdout | default('') != 'swap'  # Edit by ChatGPT
+
+# Write the fstab entry only (do NOT try to mount swap via mount(2))  # Edit by ChatGPT
+- name: Ensure /swapfile entry exists in /etc/fstab  # Edit by ChatGPT
+  ansible.posix.mount:
+    name: none           # fstab target column 2  # Edit by ChatGPT
+    src: /swapfile       # fstab column 1        # Edit by ChatGPT
+    fstype: swap         # fstab column 3        # Edit by ChatGPT
+    opts: sw             # fstab column 4        # Edit by ChatGPT
+    state: present       # manage fstab only     # Edit by ChatGPT
+
+# Activate swap if not already on  # Edit by ChatGPT
+- name: Check active swap devices  # Edit by ChatGPT
+  ansible.builtin.command: swapon --show=NAME --noheadings
+  register: swapon_list  # Edit by ChatGPT
+  changed_when: false  # Edit by ChatGPT
+  failed_when: false   # Edit by ChatGPT
+
+- name: Activate /swapfile  # Edit by ChatGPT
+  ansible.builtin.command: swapon /swapfile
+  when: "'/swapfile' not in (swapon_list.stdout_lines | default([]))"  # Edit by ChatGPT
+
+- name: Set swappiness
+  sysctl:
+    name: vm.swappiness
+    value: 50
+    state: present
+
+- name: Set vfs_cache_pressure
+  sysctl:
+    name: vm.vfs_cache_pressure
+    value: 50
+    state: present
+
+- name: Clean DNF metadata cache  # Edit by ChatGPT
+  ansible.builtin.command: dnf clean all  # Edit by ChatGPT
+  changed_when: false  # Edit by ChatGPT
+
+- name: Refresh package metadata  # Edit by ChatGPT
+  ansible.builtin.dnf:  # Edit by ChatGPT
+    update_cache: true  # Edit by ChatGPT
+
+- name: Distro-sync to align packages with repos  # Edit by ChatGPT
+  ansible.builtin.command: dnf -y --refresh distro-sync  # Edit by ChatGPT
+  register: distro_sync_result  # Edit by ChatGPT
+  changed_when: distro_sync_result.rc == 0  # Edit by ChatGPT
+
+- name: Update all packages  # Edit by ChatGPT
+  ansible.builtin.dnf:  # Edit by ChatGPT
+    name: "*"  # Edit by ChatGPT
+    state: latest  # Edit by ChatGPT
+    allowerasing: true  # Edit by ChatGPT
+
+- name: Install EPEL release first
+  dnf:
+    name: epel-release
+    state: present
+
+- name: Refresh repo metadata
+  command: dnf makecache
+  changed_when: false
+
+- name: Install basic packages
+  dnf:
+    name:
+      - dnf-automatic
+      - glibc-locale-source
+      - langpacks-en
+      - ufw
+      - unzip
+      - net-tools
+      - ca-certificates
+      - curl
+      - git
+      - vim
+      - tree
+      - tmux
+      - traceroute
+      - setroubleshoot
+      - util-linux-user
+      - systemd-container
+      - bind-utils
+      - wget
+      - bzip2
+      - zsh
+      - openssh-clients
+      - tcpdump
+    state: present
+
+####################################################
+########### Install packages #########################
+####################################################
+- name: Ensure /var/log/sssd directory exists
+  file:
+    path: /var/log/sssd
+    state: directory
+    mode: '0755'
+
+- name: Import Remi RPM GPG key
+  rpm_key:
+    state: present
+    key: http://rpms.remirepo.net/RPM-GPG-KEY-remi2024
+
+- name: Ensure trust store is up to date
+  become: true
+  block:
+    - name: Install ca-certificates if missing
+      dnf:
+        name: ca-certificates
+        state: present
+
+    - name: Update system CA trust store
+      command: update-ca-trust extract
+      changed_when: false
+
+    - name: Ensure trust store is refreshed via dnf update
+      dnf:
+        name: ca-certificates
+        state: latest
+
+- name: Download remi-release RPM without TLS verification
+  shell: |
+    curl -L -o /tmp/remi-release-10.rpm https://rpms.remirepo.net/enterprise/remi-release-10.rpm
+  args:
+    executable: /bin/bash
+
+- name: Install Remi release RPM
+  dnf:
+    name: /tmp/remi-release-10.rpm
+    state: present
+
+- name: Install additional packages
+  dnf:
+    name:
+      - python3-pip
+      - python3-devel
+      - gcc
+      - perl
+      - jq
+      - php
+      - php-zip
+      - skopeo
+    state: present
+
+- name: Flush disk buffers
+  shell: sync
+  args:
+    executable: /bin/bash
+
+- name: Sleep briefly after sync
+  pause:
+    seconds: 5
+
+- name: Reboot with generous timeouts
+  reboot:
+    connect_timeout: 30
+    reboot_timeout: 300
+    pre_reboot_delay: 0
+    post_reboot_delay: 10
+    test_command: whoami
+
+- name: Enable and start dnf-automatic timer
+  systemd:
+    name: dnf-automatic.timer
+    enabled: true
+    state: started
+
+- name: Set system locale to en_US.UTF-8
+  command: localectl set-locale LANG=en_US.UTF-8
+
+- name: Gather installed packages
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Mask firewalld to prevent activation by future updates
+  ansible.builtin.systemd:
+    name: firewalld
+    state: stopped
+    enabled: false
+    masked: true
+  ignore_errors: true
+
+- name: journald | Ensure drop-in directory exists
+  become: true
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: journald | Ensure Storage=persistent drop-in exists
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/10-persistent.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Journal]
+      Storage=persistent
+
+- name: Set zsh as default shell for current user
+  user:
+    name: "root"
+    shell: "/usr/bin/zsh"
+
+- name: Create .zshrc.d directory
+  file:
+    path: /root/.zshrc.d
+    state: directory
+    owner: "root"
+    group: "root"
+    mode: '0755'
+
+- name: Install Oh My Zsh
+  shell: |
+    RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+  args:
+    chdir: /root
+    creates: /root/.oh-my-zsh
+  environment:
+    ZSH: /root/.oh-my-zsh
+    HOME: /root
+
+- name: Install zsh-autosuggestions plugin
+  git:
+    repo: https://github.com/zsh-users/zsh-autosuggestions
+    dest: /root/.oh-my-zsh/custom/plugins/zsh-autosuggestions
+
+- name: Install zsh-syntax-highlighting plugin
+  git:
+    repo: https://github.com/zsh-users/zsh-syntax-highlighting
+    dest: /root/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting
+
+- name: Ensure python3-cryptography is installed
+  become: true
+  dnf:
+    name: python3-cryptography
+    state: present
+
+- name: Ensure python3-bcrypt is installed
+  become: true
+  dnf:
+    name: python3-bcrypt
+    state: present
+
+####
+- name: Set global Git email
+  become: false
+  git_config:
+    name: user.email
+    scope: global
+    value: "{{ EMAIL }}"
+- name: Set global Git username
+  become: false
+  git_config:
+    name: user.name
+    scope: global
+    value: "{{ REALNAME }}"
+
+- name: Set zsh theme to crcandy
+  become: false
+  lineinfile:
+    path: ~/.zshrc
+    regexp: '^ZSH_THEME='
+    line: 'ZSH_THEME="crcandy"'
+
+- name: Replace green with yellow in theme
+  become: false
+  replace:
+    path: ~/.oh-my-zsh/themes/crcandy.zsh-theme
+    regexp: 'green'
+    replace: 'yellow'
+
+- name: Set SELinux to enforcing
+  replace:
+    path: /etc/selinux/config
+    regexp: '^SELINUX=permissive'
+    replace: 'SELINUX=enforcing'
+
+- name: Reboot with generous timeouts
+  reboot:
+    connect_timeout: 30
+    reboot_timeout: 900
+    pre_reboot_delay: 0
+    post_reboot_delay: 10
+    test_command: whoami
+
+- name: Pause before reboot
+  pause:
+    seconds: 3
+
+- name: Reboot system after base setup
+  reboot:
+    reboot_timeout: 300

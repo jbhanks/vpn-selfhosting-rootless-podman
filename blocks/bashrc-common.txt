@@ -1,0 +1,11 @@
+shopt -s histappend
+export HISTSIZE=20000
+export HISTFILESIZE=20000
+export HISTIGNORE='ls:history'
+export HISTTIMEFORMAT='%F %T '
+export PROMPT_COMMAND='history -a;history -n'
+export HISTCONTROL=erasedups
+export PS1="\[\033[1;31m\]\u\[\033[m\]@\[\033[1;35m\]\h:\[\033[1;32m\]\w\[\033[m\]\$ "
+alias grep="grep --color=auto"
+alias fgrep="fgrep --color=auto"
+alias egrep="egrep --color=auto"

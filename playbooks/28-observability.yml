@@ -1,0 +1,462 @@
+---
+- name: "Observability | Set derived vars / defaults (phase 1)"
+  ansible.builtin.set_fact:
+    OBS_USER: "{{ OBS_USER | default('observability') }}"
+    OBS_ROOT: "{{ OBS_ROOT | default('/opt/observability') }}"
+    OBS_ENV_DIR: "{{ OBS_ENV_DIR | default('/etc/observability') }}"
+    OBS_QUADLET_DIR: "/home/{{ OBS_USER }}/.config/containers/systemd"
+
+    OBS_POD_NAME: "{{ OBS_POD_NAME | default('obs') }}"
+
+    LOKI_IMAGE: "{{ LOKI_IMAGE | default('docker.io/grafana/loki:3.0.0') }}"
+    PROMTAIL_IMAGE: "{{ PROMTAIL_IMAGE | default('docker.io/grafana/promtail:3.0.0') }}"
+    GRAFANA_IMAGE: "{{ GRAFANA_IMAGE | default('docker.io/grafana/grafana:11.1.0') }}"
+    DASHY_IMAGE: "{{ DASHY_IMAGE | default('docker.io/lissy93/dashy:latest') }}"
+
+    GRAFANA_PORT: "{{ GRAFANA_PORT | default(3300) | int }}"
+    DASHY_PORT: "{{ DASHY_PORT | default(9090) | int }}"
+
+    LOKI_RETENTION_HOURS: "{{ LOKI_RETENTION_HOURS | default(336) | int }}"
+
+- name: "Observability | Set derived vars / defaults (phase 2)"
+  ansible.builtin.set_fact:
+    # Optional: set these in vars; if you don't, these default to DOMAIN-based names.
+    GRAFANA_HOST: "{{ GRAFANA_HOST | default('grafana.' ~ DOMAIN) }}"
+    DASHY_HOST: "{{ DASHY_HOST | default('dashy.' ~ DOMAIN) }}"
+    DASHY_ROOT: "{{ DASHY_ROOT | default(OBS_ROOT ~ '/dashy') }}"
+    GRAFANA_ROOT: "{{ GRAFANA_ROOT | default(OBS_ROOT ~ '/grafana') }}"
+    LOKI_ROOT: "{{ LOKI_ROOT | default(OBS_ROOT ~ '/loki') }}"
+
+- name: "Observability | Ensure service user exists"
+  ansible.builtin.user:
+    name: "{{ OBS_USER }}"
+    shell: /bin/bash
+    create_home: true
+    state: present
+
+# - name: "Observability | Enable linger for service user"
+#   ansible.builtin.command: "loginctl enable-linger {{ OBS_USER }}"
+#   changed_when: false
+
+
+- name: "Observability | Get UID for service user"
+  ansible.builtin.command: "id -u {{ OBS_USER }}"
+  register: obs_uid
+  changed_when: false
+
+- name: "Observability | Set derived vars (phase 3: runtime paths)"
+  ansible.builtin.set_fact:
+    OBS_XDG_RUNTIME_DIR: "/run/user/{{ obs_uid.stdout | trim }}"
+    OBS_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ obs_uid.stdout | trim }}/bus"
+
+
+- name: "Observability | Ensure base dirs exist"
+  become: true
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0755"
+  loop:
+    - "{{ OBS_ROOT }}"
+    - "{{ LOKI_ROOT }}"
+    - "{{ OBS_ROOT }}/promtail"
+    - "{{ GRAFANA_ROOT }}"
+    - "{{ DASHY_ROOT }}"
+    - "{{ OBS_ENV_DIR }}"
+    - "{{ OBS_ENV_DIR }}/grafana-provisioning"
+
+- name: "Observability | Ensure Loki data dir is writable by container user (rootless)"
+  become: true
+  become_user: "{{ OBS_USER }}"
+  ansible.builtin.command: >-
+    podman unshare chown -R 10001:10001 {{ LOKI_ROOT }}
+  changed_when: false
+
+- name: "Observability | Ensure Grafana data dir is writable by container user (rootless)"
+  become: true
+  become_user: "{{ OBS_USER }}"
+  ansible.builtin.command: >-
+    podman unshare chown -R 472:472 {{ GRAFANA_ROOT }}
+  changed_when: false
+
+- name: "Observability | Ensure quadlet dir exists (rootless)"
+  become: true
+  ansible.builtin.file:
+    path: "{{ OBS_QUADLET_DIR }}"
+    state: directory
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0755"
+
+- name: "Observability | Add service user to systemd-journal group (for promtail)"
+  become: true
+  ansible.builtin.user:
+    name: "{{ OBS_USER }}"
+    groups: systemd-journal
+    append: true
+
+- name: "Observability | Write Loki config"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OBS_ENV_DIR }}/loki.yml"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      auth_enabled: false
+
+      server:
+        http_listen_port: 3400
+
+      common:
+        path_prefix: /loki
+        storage:
+          filesystem:
+            chunks_directory: /loki/chunks
+            rules_directory: /loki/rules
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+
+      schema_config:
+        configs:
+          - from: 2024-01-01
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+
+      compactor:
+        working_directory: /loki/compactor
+        retention_enabled: true
+        delete_request_store: filesystem
+
+      limits_config:
+        retention_period: {{ LOKI_RETENTION_HOURS }}h
+
+
+- name: "Observability | Write Promtail config"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OBS_ENV_DIR }}/promtail.yml"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server:
+        http_listen_port: 9080
+
+      positions:
+        filename: /promtail/positions.yml
+
+      clients:
+        - url: http://127.0.0.1:3400/loki/api/v1/push
+
+      scrape_configs:
+        - job_name: systemd-journal
+          journal:
+            max_age: 12h
+            labels:
+              job: systemd-journal
+          relabel_configs:
+            - source_labels: ['__journal__systemd_unit']
+              target_label: unit
+            - source_labels: ['__journal__hostname']
+              target_label: host
+
+- name: "Observability | Install rootful Promtail quadlet"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/containers/systemd/promtail.container
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Promtail (rootful, reads journald)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Container]
+      Image={{ PROMTAIL_IMAGE }}
+      ContainerName=promtail
+      Network=host
+
+      Volume={{ OBS_ENV_DIR }}/promtail.yml:/etc/promtail/promtail.yml:ro
+      Volume=/var/log/journal:/var/log/journal:ro
+      Volume=/run/log/journal:/run/log/journal:ro
+      Volume=/etc/machine-id:/etc/machine-id:ro
+
+      Exec=promtail -config.file=/etc/promtail/promtail.yml
+
+      [Service]
+      Restart=always
+      TimeoutStartSec=300
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: "Observability | systemd daemon-reload (rootful)"
+  become: true
+  ansible.builtin.command: systemctl daemon-reload
+  changed_when: false
+
+- name: "Observability | Start rootful Promtail"
+  become: true
+  ansible.builtin.command: systemctl start promtail.service
+  changed_when: false
+
+- name: "Observability | Write Grafana provisioning (Loki datasource)"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ OBS_ENV_DIR }}/grafana-provisioning/ds-loki.yml"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      apiVersion: 1
+
+      datasources:
+        - name: Loki
+          type: loki
+          access: proxy
+          url: http://loki:3400
+          isDefault: true
+          editable: false
+
+
+- name: "Observability | Stop old units (best-effort)"
+  block:
+    - name: "Observability | Stop and disable prior units"
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - "{{ OBS_POD_NAME }}-pod.service"
+        - loki.service
+        - promtail.service
+        - grafana.service
+        - dashy.service
+      failed_when: false
+  become: true
+
+
+- name: "Observability | Write quadlet: pod"
+  ansible.builtin.copy:
+    dest: "{{ OBS_QUADLET_DIR }}/{{ OBS_POD_NAME }}.pod"
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0644"
+    content: |
+      [Pod]
+      PodName={{ OBS_POD_NAME }}
+      AddHost=host.containers.internal:host-gateway
+      PublishPort=127.0.0.1:3400:3400
+      # Bind only on localhost; nginx will reverse-proxy.
+      PublishPort=127.0.0.1:{{ GRAFANA_PORT }}:3300
+      PublishPort=127.0.0.1:{{ DASHY_PORT }}:8080
+
+
+- name: "Observability | Write quadlet: Loki"
+  ansible.builtin.copy:
+    dest: "{{ OBS_QUADLET_DIR }}/loki.container"
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Observability | Loki
+
+      [Container]
+      ContainerName=loki
+      Image={{ LOKI_IMAGE }}
+      Pod={{ OBS_POD_NAME }}.pod
+
+      WorkingDir=/etc/observability
+
+      # Mount to Loki's default config name to avoid -config.file ambiguity
+      Volume={{ OBS_ENV_DIR }}/loki.yml:/etc/observability/config.yaml:ro
+      Volume={{ LOKI_ROOT }}:/loki:Z
+
+      [Service]
+      Restart=always
+      TimeoutStartSec=300
+
+      [Install]
+      WantedBy=default.target
+
+
+- name: "Observability | Write quadlet: Grafana"
+  ansible.builtin.copy:
+    dest: "{{ OBS_QUADLET_DIR }}/grafana.container"
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Observability | Grafana
+      After={{ OBS_POD_NAME }}-pod.service loki.service
+
+      [Container]
+      ContainerName=grafana
+      Image={{ GRAFANA_IMAGE }}
+      Pod={{ OBS_POD_NAME }}.pod
+
+      Volume={{ GRAFANA_ROOT }}:/var/lib/grafana:Z
+      Volume={{ OBS_ENV_DIR }}/grafana-provisioning:/etc/grafana/provisioning/datasources:ro
+
+      Environment=GF_SERVER_HTTP_PORT=3300
+      Environment=GF_SERVER_DOMAIN={{ GRAFANA_HOST }}
+      Environment=GF_SERVER_ROOT_URL=https://{{ GRAFANA_HOST }}
+
+      [Service]
+      Restart=always
+      TimeoutStartSec=300
+
+      [Install]
+      WantedBy=default.target
+
+
+- name: "Observability | Write quadlet: Dashy"
+  ansible.builtin.copy:
+    dest: "{{ OBS_QUADLET_DIR }}/dashy.container"
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Observability | Dashy
+      After={{ OBS_POD_NAME }}-pod.service
+
+      [Container]
+      ContainerName=dashy
+      Image={{ DASHY_IMAGE }}
+      Pod={{ OBS_POD_NAME }}.pod
+
+      Volume={{ DASHY_ROOT }}:/app/user-data:Z
+
+      [Service]
+      Restart=always
+      TimeoutStartSec=300
+
+      [Install]
+      WantedBy=default.target
+
+
+- name: "Observability | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ OBS_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ OBS_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ OBS_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+
+- name: "Observability | Start pod + services (generated; do not enable)"
+  block:
+    - name: "Observability | Start pod"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ OBS_USER }}@.host --user
+          start {{ OBS_POD_NAME }}-pod.service
+      changed_when: false
+
+    - name: "Observability | Start Loki"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ OBS_USER }}@.host --user
+          start loki.service
+      changed_when: false
+
+    - name: "Observability | systemd daemon-reload (rootful)"
+      become: true
+      ansible.builtin.command: systemctl daemon-reload
+      changed_when: false
+
+    - name: "Observability | Start rootful Promtail"
+      become: true
+      ansible.builtin.command: systemctl start promtail.service
+      changed_when: false
+
+    - name: "Observability | Start Grafana"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ OBS_USER }}@.host --user
+          start grafana.service
+      changed_when: false
+
+    - name: "Observability | Start Dashy"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ OBS_USER }}@.host --user
+          start dashy.service
+      changed_when: false
+
+- name: "Observability | Nginx vhost: Grafana from template"
+  become: true
+  ansible.builtin.template:
+    src: templates/nginx/grafana.conf.j2
+    dest: "/etc/nginx/conf.d/{{ GRAFANA_HOST }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: "Reload nginx"
+
+- name: "Observability | Nginx vhost: Dashy from template"
+  become: true
+  ansible.builtin.template:
+    src: templates/nginx/dashy.conf.j2
+    dest: "/etc/nginx/conf.d/{{ DASHY_HOST }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: "Reload nginx"
+
+- name: "Dashy | Ensure config directory exists"
+  become: true
+  ansible.builtin.file:
+      path: "{{ DASHY_ROOT }}"
+      state: directory
+      mode: "0755"
+
+- name: "Dashy | Render conf.yml from template"
+  become: true
+  ansible.builtin.template:
+      src: "templates/dashy/conf.yml.j2"
+      dest: "{{ DASHY_ROOT }}/conf.yml"
+      owner: "{{ OBS_USER }}"
+      group: "{{ OBS_USER }}"
+      mode: "0644"
+
+- name: "Dashy | Ensure icon directory exists"
+  become: true
+  ansible.builtin.file:
+    path: "{{ DASHY_ROOT }}/item-icons"
+    state: directory
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0755"
+
+- name: "Dashy | Copy app icon set"
+  become: true
+  ansible.builtin.copy:
+    src: "files/item-icons/"
+    dest: "{{ DASHY_ROOT }}/item-icons/"
+    owner: "{{ OBS_USER }}"
+    group: "{{ OBS_USER }}"
+    mode: "0644"
+
+- name: "Observability | Restart Dashy"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --machine={{ OBS_USER }}@.host --user
+      restart dashy.service
+  changed_when: false
+

@@ -1,0 +1,412 @@
+---
+- name: "Lockdown | Ensure ADMINUSER has new SSH pubkey"
+  ansible.posix.authorized_key:
+    user: "{{ ADMINUSER }}"
+    state: present
+    key: "{{ lookup('file', NEW_PUBKEY) }}"
+
+- name: "Lockdown | Ensure firewalld remains masked on Alma"
+  become: true
+  ansible.builtin.systemd:
+    name: firewalld
+    state: stopped
+    enabled: false
+    masked: true
+  ignore_errors: true
+
+- name: "Lockdown | Check whether cloud-init sudoers drop-in exists"
+  become: true
+  ansible.builtin.stat:
+    path: /etc/sudoers.d/90-cloud-init-users
+  register: lockdown_cloud_init_sudoers
+
+- name: "Lockdown | Remove passwordless sudo for root from cloud-init sudoers drop-in"
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/sudoers.d/90-cloud-init-users
+    regexp: '^\s*root\s+ALL=\(ALL\)\s+NOPASSWD:ALL\s*$'
+    state: absent
+    validate: "/usr/sbin/visudo -cf %s"
+  when: lockdown_cloud_init_sudoers.stat.exists
+
+- name: "Lockdown | Disable root SSH login"
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^\s*PermitRootLogin\s+'
+    line: "PermitRootLogin no"
+    create: false
+  notify: "Reload systemd and restart sshd"
+
+- name: "Lockdown | Disable SSH password authentication"
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^\s*PasswordAuthentication\s+'
+    line: "PasswordAuthentication no"
+    create: false
+  notify: "Reload systemd and restart sshd"
+
+- name: "Lockdown | Disable SSH keyboard-interactive authentication"
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^\s*KbdInteractiveAuthentication\s+'
+    line: "KbdInteractiveAuthentication no"
+    create: false
+  notify: "Reload systemd and restart sshd"
+
+- name: "Lockdown | Ensure PubkeyAuthentication is enabled"
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^\s*PubkeyAuthentication\s+'
+    line: "PubkeyAuthentication yes"
+    create: false
+  notify: "Reload systemd and restart sshd"
+
+- name: "Lockdown | Restrict sshd to ADMINPORT only"
+  become: true
+  ansible.builtin.blockinfile:
+    path: /etc/ssh/sshd_config
+    marker: "# {mark} ANSIBLE LOCKDOWN SSH PORT BLOCK"
+    block: |
+      Port {{ ADMINPORT | int }}
+  notify: "Reload systemd and restart sshd"
+
+- name: "Lockdown | Remove any standalone Port 22 directives"
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^\s*Port\s+22\s*$'
+    state: absent
+  notify: "Reload systemd and restart sshd"
+
+- name: "Lockdown | Validate sshd config"
+  become: true
+  ansible.builtin.command: /usr/sbin/sshd -t -f /etc/ssh/sshd_config
+  changed_when: false
+
+- name: "Lockdown | Ensure UFW is installed"
+  become: true
+  ansible.builtin.dnf:
+    name: ufw
+    state: present
+
+- name: "Lockdown | Set UFW default deny incoming"
+  become: true
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: "Lockdown | Set UFW default allow outgoing"
+  become: true
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+- name: "Lockdown | Allow SSH on ADMINPORT"
+  become: true
+  community.general.ufw:
+    rule: allow
+    port: "{{ ADMINPORT | string }}"
+    proto: tcp
+
+- name: "Lockdown | Deny SSH on port 22"
+  become: true
+  community.general.ufw:
+    rule: deny
+    port: "22"
+    proto: tcp
+
+- name: "Lockdown | Remove any existing UFW allow rule for port 22"
+  become: true
+  community.general.ufw:
+      rule: allow
+      delete: true
+      port: "22"
+      proto: tcp
+
+- name: "Lockdown | Remove any existing UFW OpenSSH app rule"
+  become: true
+  community.general.ufw:
+      rule: allow
+      delete: true
+      name: OpenSSH
+
+- name: "Lockdown | Enable UFW"
+  become: true
+  community.general.ufw:
+    state: enabled
+
+- name: "Lockdown | Tame UFW logging"
+  become: true
+  ansible.builtin.command: ufw logging low
+  changed_when: false
+  failed_when: false
+
+- name: "Lockdown | Flush SSH handler before connectivity checks"
+  ansible.builtin.meta: flush_handlers
+
+- name: "Lockdown | Wait for SSH on ADMINPORT"
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host | default(inventory_hostname) }}"
+    port: "{{ ADMINPORT | int }}"
+    state: started
+    delay: 0
+    timeout: 30
+  delegate_to: localhost
+  become: false
+
+- name: "Lockdown | Canary SSH as ADMINUSER on ADMINPORT"
+  become: false
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  ansible.builtin.shell: >
+    ssh -p {{ ADMINPORT | int }}
+    -o BatchMode=yes
+    -o ConnectTimeout=5
+    -o PreferredAuthentications=publickey
+    -o PasswordAuthentication=no
+    -o StrictHostKeyChecking=no
+    {% if SSH_IDENTITY_FILE is defined %}-i {{ SSH_IDENTITY_FILE }}{% endif %}
+    {{ ADMINUSER }}@{{ ansible_host | default(inventory_hostname) }} echo ok
+
+- name: "Lockdown | Install fail2ban"
+  become: true
+  ansible.builtin.dnf:
+    name: fail2ban
+    state: present
+
+- name: "Lockdown | Whitelist workstation in fail2ban"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/whitelist.local
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [DEFAULT]
+      ignoreip = 127.0.0.1/8 ::1 {{ LOCALIP }}
+  notify: "Restart fail2ban"
+
+- name: "Lockdown | Enable fail2ban"
+  become: true
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: true
+    state: started
+
+- name: "Lockdown | Ensure dnf-automatic is installed"
+  become: true
+  ansible.builtin.dnf:
+    name: dnf-automatic
+    state: present
+
+- name: "Lockdown | Configure dnf-automatic"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/dnf/automatic.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [commands]
+      upgrade_type = default
+      random_sleep = 0
+      download_updates = yes
+      apply_updates = yes
+      reboot = when-needed
+
+      [emitters]
+      emit_via = stdio
+      system_name = {{ inventory_hostname }}
+
+      [command]
+      command_format = cat
+      stdin_format = {body}
+
+      [command_email]
+      command_format = mail -Ssendwait -s {subject} -r {email_from} {email_to}
+      stdin_format = {body}
+
+      [email]
+      email_from = root@localhost
+      email_to = root
+      email_host = localhost
+
+      [base]
+      debuglevel = 1
+
+- name: "Lockdown | Disable non-install dnf-automatic timers"
+  become: true
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop:
+    - dnf-automatic.timer
+    - dnf-automatic-download.timer
+    - dnf-automatic-notifyonly.timer
+  failed_when: false
+
+- name: "Lockdown | Enable dnf-automatic-install.timer"
+  become: true
+  ansible.builtin.systemd:
+    name: dnf-automatic-install.timer
+    enabled: true
+    state: started
+
+- name: "Checks | Install post-reboot service check script"
+  become: true
+  ansible.builtin.template:
+    src: check-services-after-reboot.sh.j2
+    dest: /usr/local/sbin/check-services-after-reboot.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "Checks | Install post-reboot service check systemd service"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/check-services-after-reboot.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Check rootless service users after reboot
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/check-services-after-reboot.sh
+
+- name: "Checks | Install post-reboot service check systemd timer"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/check-services-after-reboot.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run post-reboot service check daily at 4:20 AM
+
+      [Timer]
+      OnBootSec=5min
+      OnCalendar=*-*-* 04:20:00
+      Persistent=true
+      Unit=check-services-after-reboot.service
+
+      [Install]
+      WantedBy=timers.target
+
+- name: "Checks | Reload systemd"
+  become: true
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: "Checks | Enable and start post-reboot service check timer"
+  become: true
+  ansible.builtin.systemd:
+    name: check-services-after-reboot.timer
+    enabled: true
+    state: started
+
+- name: "Lockdown | Install curl for fail2ban ntfy action"
+  become: true
+  ansible.builtin.dnf:
+    name: curl
+    state: present
+
+- name: "Lockdown | Configure fail2ban ntfy action"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/action.d/ntfy.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Definition]
+
+      actionstart =
+      actionstop =
+      actioncheck =
+
+      actionban = /usr/bin/curl -fsS -m 10 \
+          -H "Title: Fail2ban on <hostname>" \
+          -H "Priority: 4" \
+          -H "Tags: warning,lock" \
+          -d "Host <hostname>: banned <ip> after <failures> failures in jail <name>" \
+          https://ntfy.{{ DOMAIN }}/fail2ban
+
+      actionunban = /usr/bin/curl -fsS -m 10 \
+          -H "Title: Fail2ban on <hostname>" \
+          -H "Priority: 3" \
+          -H "Tags: unlock" \
+          -d "Host <hostname>: unbanned <ip> from jail <name>" \
+          https://ntfy.{{ DOMAIN }}/fail2ban
+  notify: "Restart fail2ban"
+
+- name: "Lockdown | Build fail2ban ignoreip list"
+  ansible.builtin.set_fact:
+    FAIL2BAN_IGNOREIP: >-
+      {{ (
+            ['127.0.0.1/8', '::1']
+            + ([WG_SUBNET_CIDR]
+               if (WG_SUBNET_CIDR is defined and WG_SUBNET_CIDR | trim != '')
+               else [])
+            + ([LOCALIP]
+               if (LOCALIP is defined and LOCALIP | trim != '')
+               else [])
+         ) | unique
+      }}
+
+- name: "Lockdown | Configure fail2ban jail.local"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.local
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [DEFAULT]
+      ignoreip = {{ FAIL2BAN_IGNOREIP | join(' ') }}
+      bantime = 86400
+      findtime = 86400
+
+      [sshd]
+      enabled = true
+      port = {{ ADMINPORT | int }}
+      filter = sshd
+      logpath = /var/log/secure
+      maxretry = 5
+      action = %(action_)s
+               ntfy
+  notify: "Restart fail2ban"
+
+- name: "Lockdown | Flush remaining handlers before final reminder"
+  ansible.builtin.meta: flush_handlers
+
+- name: "Lockdown | FINAL STEP — manual key removal reminder"
+  ansible.builtin.pause:
+    prompt: |
+
+      ########################################################################
+      #                                                                      #
+      #                   SETUP IS ALMOST COMPLETE                           #
+      #                                                                      #
+      ########################################################################
+
+      To finish locking down the server:
+
+        1. SSH in using the newly generated key
+        2. Edit ~/.ssh/authorized_keys
+        3. Delete the line containing the OLD key
+
+           nano ~/.ssh/authorized_keys
+
+      Press ENTER after you have completed this step.

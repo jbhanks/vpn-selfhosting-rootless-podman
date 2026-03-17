@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -u
+
+users=(
+{% for app in APPS %}
+  {{ app }}
+{% endfor %}
+)
+
+red=$'\033[31m'
+green=$'\033[32m'
+yellow=$'\033[33m'
+blue=$'\033[34m'
+reset=$'\033[0m'
+
+have_fail=0
+
+run_as_user() {
+    local user="$1"
+    shift
+    sudo -Hiu "$user" env "XDG_RUNTIME_DIR=/run/user/$(id -u "$user")" "$@"
+}
+
+echo
+echo "${blue}=== Post-reboot service check ===${reset}"
+echo
+
+for user in "${users[@]}"; do
+    echo "${blue}--- ${user} ---${reset}"
+
+    if ! id "$user" >/dev/null 2>&1; then
+        echo "${red}MISSING USER${reset}"
+        have_fail=1
+        echo
+        continue
+    fi
+
+    uid="$(id -u "$user")"
+    runtime_dir="/run/user/$uid"
+
+    if [[ ! -d "$runtime_dir" ]]; then
+        echo "${red}NO RUNTIME DIR: ${runtime_dir}${reset}"
+        echo "Likely no lingering session/user manager."
+        have_fail=1
+        echo
+        continue
+    fi
+
+    if ! run_as_user "$user" systemctl --user is-system-running >/dev/null 2>&1; then
+        echo "${yellow}systemd --user not fully healthy or not responding${reset}"
+    else
+        echo "${green}systemd --user responds${reset}"
+    fi
+
+    failed_units="$(run_as_user "$user" systemctl --user --failed --no-legend --plain 2>/dev/null || true)"
+    if [[ -n "$failed_units" ]]; then
+        echo "${red}FAILED USER UNITS:${reset}"
+        echo "$failed_units"
+        have_fail=1
+    else
+        echo "${green}No failed user units${reset}"
+    fi
+
+    if command -v podman >/dev/null 2>&1; then
+        containers="$(run_as_user "$user" podman ps --format 'table {% raw %}{{.Names}}\t{{.Status}}{% endraw %}' 2>/dev/null || true)"
+        if [[ -n "$containers" ]]; then
+            echo "${green}Running containers:${reset}"
+            echo "$containers"
+        else
+            echo "${yellow}No running containers for ${user}${reset}"
+        fi
+
+        all_containers="$(run_as_user "$user" podman ps -a --format 'table {% raw %}{{.Names}}\t{{.Status}}{% endraw %}' 2>/dev/null || true)"
+        if [[ -n "$all_containers" ]]; then
+            echo "${blue}All containers:${reset}"
+            echo "$all_containers"
+        fi
+    fi
+
+    echo
+done
+
+echo "${blue}=== Summary ===${reset}"
+if [[ "$have_fail" -eq 0 ]]; then
+    echo "${green}No hard failures detected.${reset}"
+    exit 0
+else
+    echo "${red}One or more failures detected.${reset}"
+    exit 1
+fi

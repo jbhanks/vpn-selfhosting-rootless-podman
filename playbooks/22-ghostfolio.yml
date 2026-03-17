@@ -1,0 +1,387 @@
+---
+- name: Ghostfolio | Set derived vars / defaults
+  ansible.builtin.set_fact:
+    GHOSTFOLIO_USER: "{{ GHOSTFOLIO_USER | default('ghostfolio') }}"
+    GHOSTFOLIO_ROOT: "{{ GHOSTFOLIO_ROOT | default('/opt/ghostfolio') }}"
+    GHOSTFOLIO_ENV_DIR: "{{ GHOSTFOLIO_ENV_DIR | default('/etc/ghostfolio') }}"
+    GHOSTFOLIO_ENV_FILE: "{{ GHOSTFOLIO_ENV_FILE | default('/etc/ghostfolio/ghostfolio.env') }}"
+    GHOSTFOLIO_QUADLET_DIR: "{{ GHOSTFOLIO_QUADLET_DIR | default('/home/' ~ (GHOSTFOLIO_USER | default('ghostfolio')) ~ '/.config/containers/systemd') }}"
+
+    GHOSTFOLIO_NET_NAME: "{{ GHOSTFOLIO_NET_NAME | default('ghostfolio_net') }}"
+    GHOSTFOLIO_POD_NAME: "{{ GHOSTFOLIO_POD_NAME | default('ghostfolio') }}"
+
+    GHOSTFOLIO_IMAGE: "{{ GHOSTFOLIO_IMAGE | default('docker.io/ghostfolio/ghostfolio:latest') }}"
+    GHOSTFOLIO_REDIS_IMAGE: "{{ GHOSTFOLIO_REDIS_IMAGE | default('docker.io/library/redis:7-alpine') }}"
+
+    # Hostname for nginx + ROOT_URL
+    GHOSTFOLIO_HOST: "{{ GHOSTFOLIO_HOST | default('ghostfolio.' ~ DOMAIN) }}"
+
+    # Publish Ghostfolio to loopback only; nginx proxies to this.
+    GHOSTFOLIO_LISTEN_HOST: "{{ GHOSTFOLIO_LISTEN_HOST | default('127.0.0.1') }}"
+    GHOSTFOLIO_LISTEN_PORT: "{{ GHOSTFOLIO_LISTEN_PORT | default(3333) }}"
+
+    # Postgres on the *host* (not in a container). For rootless containers, this is the usual “host gateway” name.
+    GHOSTFOLIO_PG_HOST: "{{ GHOSTFOLIO_PG_HOST | default('host.containers.internal') }}"
+    GHOSTFOLIO_PG_PORT: "{{ GHOSTFOLIO_PG_PORT | default(5432) }}"
+    GHOSTFOLIO_PG_DB: "{{ GHOSTFOLIO_PG_DB | default('ghostfolio') }}"
+    GHOSTFOLIO_PG_USER: "{{ GHOSTFOLIO_PG_USER | default('ghostfolio') }}"
+    GHOSTFOLIO_PG_PASSWORD: "{{ GHOSTFOLIO_PG_PASSWORD | default(omit) }}"
+
+    # You should set this explicitly (vault/vars). It must be a random string. :contentReference[oaicite:3]{index=3}
+    GHOSTFOLIO_JWT_SECRET_KEY: "{{ GHOSTFOLIO_JWT_SECRET_KEY | default(omit) }}"
+    GHOSTFOLIO_SALT: "{{ GHOSTFOLIO_SALT | default(omit) }}"
+
+    # Redis runs inside the same pod; reachable via localhost inside the pod network namespace.
+    GHOSTFOLIO_REDIS_HOST: "{{ GHOSTFOLIO_REDIS_HOST | default('127.0.0.1') }}"
+    GHOSTFOLIO_REDIS_PORT: "{{ GHOSTFOLIO_REDIS_PORT | default(6379) }}"
+    GHOSTFOLIO_REDIS_DB: "{{ GHOSTFOLIO_REDIS_DB | default(0) }}"
+
+- name: Ghostfolio | Create system user
+  ansible.builtin.user:
+    name: "{{ GHOSTFOLIO_USER }}"
+    system: true
+    create_home: true
+    shell: /sbin/nologin
+
+- name: Ghostfolio | Ensure directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ GHOSTFOLIO_ROOT }}", owner: "{{ GHOSTFOLIO_USER }}", group: "{{ GHOSTFOLIO_USER }}", mode: "0750" }
+    - { path: "{{ GHOSTFOLIO_ENV_DIR }}", owner: "root", group: "{{ GHOSTFOLIO_USER }}", mode: "0750" }
+    - { path: "{{ GHOSTFOLIO_QUADLET_DIR }}", owner: "{{ GHOSTFOLIO_USER }}", group: "{{ GHOSTFOLIO_USER }}", mode: "0755" }
+
+- name: Ghostfolio | Derive runtime dir for user systemd (root controlling rootless)
+  block:
+    - name: Ghostfolio | Get UID of {{ GHOSTFOLIO_USER }}
+      ansible.builtin.command: "id -u {{ GHOSTFOLIO_USER }}"
+      register: ghostfolio_uid
+      changed_when: false
+
+    - name: Ghostfolio | Set runtime facts
+      ansible.builtin.set_fact:
+        GHOSTFOLIO_UID: "{{ ghostfolio_uid.stdout | trim }}"
+        GHOSTFOLIO_XDG_RUNTIME_DIR: "/run/user/{{ ghostfolio_uid.stdout | trim }}"
+        GHOSTFOLIO_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ghostfolio_uid.stdout | trim }}/bus"
+
+    - name: Ghostfolio | Ensure XDG runtime dir exists
+      ansible.builtin.file:
+        path: "{{ GHOSTFOLIO_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ GHOSTFOLIO_USER }}"
+        group: "{{ GHOSTFOLIO_USER }}"
+        mode: "0700"
+
+    - name: Ghostfolio | Ensure user manager is started (user@UID)
+      ansible.builtin.systemd:
+        name: "user@{{ GHOSTFOLIO_UID }}.service"
+        state: started
+  become: true
+
+####################################################################
+# Postgres
+#####################################################################
+
+- name: "Ghostfolio | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "Ghostfolio | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: ghostfolio_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "Ghostfolio | Postgres: allow podman subnet (ghostfolio -> ghostfolio)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ ghostfolio_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ GHOSTFOLIO_PG_DB }}"
+        users: "{{ GHOSTFOLIO_PG_USER }}"
+        source: "{{ GHOSTFOLIO_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: GHOSTFOLIO_PODMAN_SUBNET is defined
+
+    - name: "Ghostfolio | Postgres: allow podman subnet (postgres -> ghostfolio db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ ghostfolio_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ GHOSTFOLIO_PG_DB }}"
+        users: postgres
+        source: "{{ GHOSTFOLIO_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: GHOSTFOLIO_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "Ghostfolio | Postgres: allow samehost (ghostfolio -> ghostfolio)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ ghostfolio_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ GHOSTFOLIO_PG_DB }}"
+        users: "{{ GHOSTFOLIO_PG_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Ghostfolio | Postgres: allow samehost (postgres -> ghostfolio db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ ghostfolio_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ GHOSTFOLIO_PG_DB }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Ghostfolio | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "Ghostfolio | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ GHOSTFOLIO_PG_USER }}"
+        password: "{{ GHOSTFOLIO_PG_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "Ghostfolio | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ GHOSTFOLIO_PG_DB }}"
+        owner: "{{ GHOSTFOLIO_PG_USER }}"
+        state: present
+# --------------------------------------------------------------------
+# Optional: create DB + user on host Postgres (idempotent).
+# If you already do DB provisioning elsewhere, delete this block.
+# --------------------------------------------------------------------
+# - name: Ghostfolio | Ensure postgres role exists
+#   become: true
+#   become_user: postgres
+#   community.postgresql.postgresql_user:
+#     name: "{{ GHOSTFOLIO_PG_USER }}"
+#     password: "{{ GHOSTFOLIO_PG_PASSWORD }}"
+#     state: present
+#   when:
+#     - GHOSTFOLIO_PG_PASSWORD is defined
+
+# - name: Ghostfolio | Ensure postgres database exists
+#   become: true
+#   become_user: postgres
+#   community.postgresql.postgresql_db:
+#     name: "{{ GHOSTFOLIO_PG_DB }}"
+#     owner: "{{ GHOSTFOLIO_PG_USER }}"
+#     state: present
+#   when:
+#     - GHOSTFOLIO_PG_PASSWORD is defined
+
+# --------------------------------------------------------------------
+# Env file for the Ghostfolio container.
+# Ghostfolio supports DATABASE_URL + POSTGRES_* + REDIS_* + JWT_SECRET_KEY + PORT etc. :contentReference[oaicite:4]{index=4}
+# --------------------------------------------------------------------
+- name: Ghostfolio | Ensure env dir exists
+  ansible.builtin.file:
+    path: "{{ GHOSTFOLIO_ENV_DIR }}"
+    state: directory
+    owner: root
+    group: "{{ GHOSTFOLIO_USER }}"
+    mode: "0750"
+
+- name: Ghostfolio | Write env file
+  ansible.builtin.copy:
+    dest: "{{ GHOSTFOLIO_ENV_FILE }}"
+    owner: root
+    group: "{{ GHOSTFOLIO_USER }}"
+    mode: "0640"
+    content: |
+      # Ghostfolio
+      PORT={{ GHOSTFOLIO_LISTEN_PORT }}
+      HOST=0.0.0.0
+      ROOT_URL=https://{{ GHOSTFOLIO_HOST }}
+
+      DATABASE_URL=postgresql://{{ GHOSTFOLIO_PG_USER }}:{{ GHOSTFOLIO_PG_PASSWORD }}@{{ GHOSTFOLIO_PG_HOST }}:{{ GHOSTFOLIO_PG_PORT }}/{{ GHOSTFOLIO_PG_DB }}?sslmode=prefer
+
+      JWT_SECRET_KEY={{ GHOSTFOLIO_JWT_SECRET_KEY }}
+
+      REDIS_HOST=127.0.0.1
+      REDIS_PORT=6379
+      REDIS_DB=0
+
+      ACCESS_TOKEN_SALT={{ GHOSTFOLIO_SALT }}
+
+# --------------------------------------------------------------------
+# Quadlets (rootless): a pod + redis + ghostfolio containers
+# --------------------------------------------------------------------
+
+- name: Ghostfolio | Pod quadlet
+  ansible.builtin.copy:
+    dest: "{{ GHOSTFOLIO_QUADLET_DIR }}/{{ GHOSTFOLIO_POD_NAME }}.pod"
+    owner: "{{ GHOSTFOLIO_USER }}"
+    group: "{{ GHOSTFOLIO_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Ghostfolio Pod
+
+      [Pod]
+      PodName={{ GHOSTFOLIO_POD_NAME }}
+      Network={{ GHOSTFOLIO_NET_NAME }}
+
+      # Publish to host; nginx reverse proxies to this.
+      PublishPort={{ GHOSTFOLIO_LISTEN_PORT }}:{{ GHOSTFOLIO_LISTEN_PORT }}
+
+      [Install]
+      WantedBy=default.target
+
+
+- name: Ghostfolio | Redis quadlet
+  ansible.builtin.copy:
+    dest: "{{ GHOSTFOLIO_QUADLET_DIR }}/{{ GHOSTFOLIO_POD_NAME }}-redis.container"
+    owner: "{{ GHOSTFOLIO_USER }}"
+    group: "{{ GHOSTFOLIO_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Ghostfolio Redis (in-pod)
+      Requires={{ GHOSTFOLIO_POD_NAME }}-pod.service
+      After={{ GHOSTFOLIO_POD_NAME }}-pod.service
+
+      [Container]
+      ContainerName={{ GHOSTFOLIO_POD_NAME }}_redis
+      Image={{ GHOSTFOLIO_REDIS_IMAGE }}
+      AutoUpdate=registry
+      PodmanArgs=--pod {{ GHOSTFOLIO_POD_NAME }}
+
+      [Install]
+      WantedBy=default.target
+
+
+- name: Ghostfolio | App quadlet
+  ansible.builtin.copy:
+    dest: "{{ GHOSTFOLIO_QUADLET_DIR }}/{{ GHOSTFOLIO_POD_NAME }}.container"
+    owner: "{{ GHOSTFOLIO_USER }}"
+    group: "{{ GHOSTFOLIO_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Ghostfolio
+      Requires={{ GHOSTFOLIO_POD_NAME }}-pod.service
+      After={{ GHOSTFOLIO_POD_NAME }}-pod.service
+      Requires={{ GHOSTFOLIO_POD_NAME }}-redis.service
+      After={{ GHOSTFOLIO_POD_NAME }}-redis.service
+
+      [Container]
+      ContainerName={{ GHOSTFOLIO_POD_NAME }}
+      Image={{ GHOSTFOLIO_IMAGE }}
+      AutoUpdate=registry
+      EnvironmentFile={{ GHOSTFOLIO_ENV_FILE }}
+      PodmanArgs=--pod {{ GHOSTFOLIO_POD_NAME }}
+
+      [Install]
+      WantedBy=default.target
+
+
+
+- name: Ghostfolio | Ensure podman network exists (rootless)
+  become: true
+  become_user: "{{ GHOSTFOLIO_USER }}"
+  changed_when: false
+  ansible.builtin.shell: |
+    set -euo pipefail
+    podman network exists "{{ GHOSTFOLIO_NET_NAME }}" || podman network create "{{ GHOSTFOLIO_NET_NAME }}"
+
+- name: "Ghostfolio | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ GHOSTFOLIO_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ GHOSTFOLIO_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GHOSTFOLIO_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+
+# - name: "Ghostfolio | Start container service (generated; do not enable)"
+#   block:
+#     - name: "Ghostfolio | Start service"
+#       ansible.builtin.command:
+#         cmd: >-
+#           systemctl --machine={{ GHOSTFOLIO_USER }}@.host --user
+#           start ghostfolio.service
+#       changed_when: false
+
+- name: "Ghostfolio | Start container service (generated; do not enable)"
+  become: true
+  become_user: "{{ GHOSTFOLIO_USER }}"
+  ansible.builtin.command: >
+    systemctl --user start
+    {{ GHOSTFOLIO_POD_NAME }}-pod.service
+    {{ GHOSTFOLIO_POD_NAME }}-redis.service
+    {{ GHOSTFOLIO_POD_NAME }}.service
+  environment:
+    XDG_RUNTIME_DIR: "{{ GHOSTFOLIO_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ GHOSTFOLIO_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+
+# --------------------------------------------------------------------
+# Nginx vhost (host-level reverse proxy)
+# --------------------------------------------------------------------
+- name: "Ghostfolio | Nginx vhost"
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ GHOSTFOLIO_HOST }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ GHOSTFOLIO_HOST }};
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen {{  WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ GHOSTFOLIO_HOST }};
+
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log  /var/log/nginx/{{ GHOSTFOLIO_HOST }}_access.log  main;
+          error_log   /var/log/nginx/{{ GHOSTFOLIO_HOST }}_error.log;
+
+          location / {
+              proxy_pass http://{{ GHOSTFOLIO_LISTEN_HOST }}:{{ GHOSTFOLIO_LISTEN_PORT }};
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+      }
+
+- name: Ghostfolio | nginx reload
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

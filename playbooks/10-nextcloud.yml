@@ -1,0 +1,596 @@
+---
+# Nextcloud (rootless Podman via quadlet) — Apache image behind host nginx
+# Using host Postgres (recommended) instead of SQLite.
+#
+# Required vars (vars.yml):
+#   NEXTCLOUD_USER
+#   NEXTCLOUD_FQDN
+#   NEXTCLOUD_ADMIN_USER
+#   NEXTCLOUD_ADMIN_PASS
+#   NEXTCLOUD_OFFICE_URL
+#   NEXTCLOUD_DB_PASS
+#
+# Optional vars:
+#   NEXTCLOUD_DB_HOST (default host.containers.internal)
+#   NEXTCLOUD_DB_PORT (default 5432)
+#   NEXTCLOUD_DB_NAME (default nextcloud)
+#   NEXTCLOUD_DB_USER (default NEXTCLOUD_USER)
+#
+# Recommended Collabora setting:
+#   COLLABORA_WOPI_ALLOW_REGEX: "^nextcloud\\.{{ DOMAIN }}$"
+
+- name: "Nextcloud | Assert required vars"
+  ansible.builtin.assert:
+      that:
+          - NEXTCLOUD_USER is defined
+          - NEXTCLOUD_FQDN is defined
+          - NEXTCLOUD_ADMIN_USER is defined
+          - NEXTCLOUD_ADMIN_PASS is defined
+          - NEXTCLOUD_OFFICE_URL is defined
+          - NEXTCLOUD_DB_PASS is defined
+      fail_msg: "Define NEXTCLOUD_USER, NEXTCLOUD_FQDN, NEXTCLOUD_ADMIN_USER, NEXTCLOUD_ADMIN_PASS, NEXTCLOUD_OFFICE_URL, NEXTCLOUD_DB_PASS."
+
+- name: "Nextcloud | Set derived vars defaults"
+  ansible.builtin.set_fact:
+    NEXTCLOUD_USER: "{{ NEXTCLOUD_USER | default('nextcloud') }}"
+    NEXTCLOUD_QUADLET_DIR: "{{ NEXTCLOUD_QUADLET_DIR | default('/home/' ~ NEXTCLOUD_USER ~ '/.config/containers/systemd') }}"
+
+    NEXTCLOUD_IMAGE: "{{ NEXTCLOUD_IMAGE | default('docker.io/library/nextcloud:apache') }}"
+    NEXTCLOUD_LISTEN_ADDR: "{{ NEXTCLOUD_LISTEN_ADDR | default('127.0.0.1') }}"
+    NEXTCLOUD_LISTEN_PORT: "{{ NEXTCLOUD_LISTEN_PORT | default(8082) | int }}"
+
+    NEXTCLOUD_FQDN: "{{ NEXTCLOUD_FQDN | default('nextcloud.' ~ DOMAIN) }}"
+
+    # Base path on your block device
+    NEXTCLOUD_DATA_DIR: "{{ NEXTCLOUD_DATA_DIR | default(BLOCKDEV ~ '/nextcloud') }}"
+
+    # Option 1 layout (separate mounts)
+    NEXTCLOUD_HTML_DIR: "{{ NEXTCLOUD_HTML_DIR | default(NEXTCLOUD_DATA_DIR ~ '/html') }}"
+    NEXTCLOUD_DATA_PATH: "{{ NEXTCLOUD_DATA_PATH | default(NEXTCLOUD_DATA_DIR ~ '/data') }}"
+
+    # Postgres
+    NEXTCLOUD_DB_HOST: "{{ NEXTCLOUD_DB_HOST | default('host.containers.internal') }}"
+    NEXTCLOUD_DB_NAME: "{{ NEXTCLOUD_DB_NAME | default(DBNAME) }}"
+    NEXTCLOUD_DB_USER: "{{ NEXTCLOUD_DB_USER | default(DBUSERNAME) }}"
+    NEXTCLOUD_DB_PASS: "{{ NEXTCLOUD_DB_PASS | default(DBUSERPASS) }}"
+
+    # Bootstrap admin user (first install only)
+    NEXTCLOUD_ADMIN_USER: "{{ NEXTCLOUD_ADMIN_USER | default('admin') }}"
+    NEXTCLOUD_ADMIN_PASS: "{{ NEXTCLOUD_ADMIN_PASS | default('changethispassword') }}"
+
+    # Certificates
+    NEXTCLOUD_CA_DIR: "/home/{{ NEXTCLOUD_USER }}/.config/ca"
+
+- name: "Nextcloud | derive CA cert path"
+  ansible.builtin.set_fact:
+    NEXTCLOUD_CA_CERT: "{{ NEXTCLOUD_CA_DIR }}/{{ DOMAIN }}-trust-root.crt"
+
+# - name: "Nextcloud | Ensure rootless networking deps (slirp4netns)"
+#   become: true
+#   ansible.builtin.package:
+#     name:
+#       - slirp4netns
+#     state: present
+
+####################################################################
+# Postgres
+#####################################################################
+
+- name: "Nextcloud | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "Nextcloud | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: nextcloud_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "Nextcloud | Postgres: allow podman subnet (nextcloud -> nextcloud)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ nextcloud_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ NEXTCLOUD_DB_NAME }}"
+        users: "{{ NEXTCLOUD_DB_USER }}"
+        source: "{{ NEXTCLOUD_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: NEXTCLOUD_PODMAN_SUBNET is defined
+
+    - name: "Nextcloud | Postgres: allow podman subnet (postgres -> nextcloud db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ nextcloud_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ NEXTCLOUD_DB_NAME }}"
+        users: postgres
+        source: "{{ NEXTCLOUD_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: NEXTCLOUD_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "Nextcloud | Postgres: allow samehost (nextcloud -> nextcloud)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ nextcloud_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ NEXTCLOUD_DB_NAME }}"
+        users: "{{ NEXTCLOUD_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Nextcloud | Postgres: allow samehost (postgres -> nextcloud db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ nextcloud_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ NEXTCLOUD_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Nextcloud | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "Nextcloud | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ NEXTCLOUD_DB_USER }}"
+        password: "{{ NEXTCLOUD_DB_PASS }}"
+        encrypted: true
+        state: present
+
+    - name: "Nextcloud | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ NEXTCLOUD_DB_NAME }}"
+        owner: "{{ NEXTCLOUD_DB_USER }}"
+        state: present
+
+- name: "Nextcloud | Get UID for {{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: "id -u {{ NEXTCLOUD_USER }}"
+  register: nextcloud_uid
+  changed_when: false
+
+- name: "Nextcloud | Ensure quadlet dir exists"
+  become: true
+  ansible.builtin.file:
+      path: "{{ NEXTCLOUD_QUADLET_DIR }}"
+      state: directory
+      owner: "{{ NEXTCLOUD_USER }}"
+      group: "{{ NEXTCLOUD_USER }}"
+      mode: "0750"
+
+- name: "Nextcloud | Ensure storage dirs exist (Option 1: html + data)"
+  become: true
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ NEXTCLOUD_USER }}"
+    group: "{{ NEXTCLOUD_USER }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ NEXTCLOUD_DATA_DIR }}",  mode: "0750" }
+    - { path: "{{ NEXTCLOUD_HTML_DIR }}",  mode: "0755" }  # must be traversable by www-data
+    - { path: "{{ NEXTCLOUD_DATA_PATH }}", mode: "0770" }  # will be made www-data writable inside container
+
+- name: "Nextcloud | Ensure CA dir exists"
+  become: true
+  ansible.builtin.file:
+    path: "{{ NEXTCLOUD_CA_DIR }}"
+    state: directory
+    owner: "{{ NEXTCLOUD_USER }}"
+    group: "{{ NEXTCLOUD_USER }}"
+    mode: "0755"
+
+- name: "Nextcloud | Install internal root CA for container use"
+  become: true
+  ansible.builtin.copy:
+    src: "/etc/pki/nginx/{{ DOMAIN }}/ca.crt"
+    dest: "{{ NEXTCLOUD_CA_CERT }}"
+    owner: "{{ NEXTCLOUD_USER }}"
+    group: "{{ NEXTCLOUD_USER }}"
+    mode: "0644"
+    remote_src: true
+
+- name: "Nextcloud | Write quadlet container file"
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ NEXTCLOUD_QUADLET_DIR }}/nextcloud.container"
+    owner: "{{ NEXTCLOUD_USER }}"
+    group: "{{ NEXTCLOUD_USER }}"
+    mode: "0640"
+    content: |
+      [Unit]
+      Description=Nextcloud (rootless) behind nginx
+      Wants=network-online.target
+      After=network-online.target
+
+      [Container]
+      ContainerName=nextcloud
+      Image={{ NEXTCLOUD_IMAGE }}
+
+      # Rootless networking: allow reaching host services (e.g., Postgres).
+      Network=slirp4netns:allow_host_loopback=true
+      AddHost=collabora.{{ DOMAIN }}:{{ WG_SERVER_IP }}
+      Volume={{ NEXTCLOUD_CA_CERT }}:/usr/local/share/ca-certificates/{{ DOMAIN }}-root.crt:ro,Z
+
+      # Bind only to localhost; nginx will reverse proxy.
+      PublishPort={{ NEXTCLOUD_LISTEN_ADDR }}:{{ NEXTCLOUD_LISTEN_PORT }}:80/tcp
+
+      # Persistent storage (Option 1)
+      Volume={{ NEXTCLOUD_HTML_DIR }}:/var/www/html:Z
+      Volume={{ NEXTCLOUD_DATA_PATH }}:/var/www/html/data:Z
+
+      # Bootstrap admin user (used on first install)
+      Environment=NEXTCLOUD_ADMIN_USER={{ NEXTCLOUD_ADMIN_USER }}
+      Environment=NEXTCLOUD_ADMIN_PASSWORD={{ NEXTCLOUD_ADMIN_PASS }}
+
+      [Service]
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=default.target
+
+
+- name: "Nextcloud | Ensure rootless networking deps (slirp4netns)"
+  become: true
+  ansible.builtin.package:
+      name:
+          - slirp4netns
+      state: present
+
+- name: "Nextcloud | systemd user daemon-reload"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "Nextcloud | Start service (do not enable)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: "systemctl --user start nextcloud.service"
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "Nextcloud | Wait for backend port"
+  ansible.builtin.wait_for:
+      host: "{{ NEXTCLOUD_LISTEN_ADDR }}"
+      port: "{{ NEXTCLOUD_LISTEN_PORT }}"
+      timeout: 90
+
+- name: "Nextcloud | SELinux: allow nginx connect out"
+  become: true
+  ansible.posix.seboolean:
+      name: httpd_can_network_connect
+      state: true
+      persistent: true
+
+- name: "Nextcloud | Write nginx vhost"
+  become: true
+  ansible.builtin.copy:
+      dest: "/etc/nginx/conf.d/{{ NEXTCLOUD_FQDN }}.conf"
+      owner: root
+      group: root
+      mode: "0644"
+      content: |
+        upstream nextcloud_backend {
+            server {{ NEXTCLOUD_LISTEN_ADDR }}:{{ NEXTCLOUD_LISTEN_PORT }};
+        }
+
+        server {
+            listen {{ WG_SERVER_IP }}:80;
+            server_name {{ NEXTCLOUD_FQDN }};
+            return 301 https://$host$request_uri;
+        }
+
+        server {
+            listen {{ WG_SERVER_IP }}:443 ssl;
+            http2 on;
+            server_name {{ NEXTCLOUD_FQDN }};
+            ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+            ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+
+            access_log  /var/log/nginx/{{ NEXTCLOUD_FQDN }}_access.log  main;
+            error_log   /var/log/nginx/{{ NEXTCLOUD_FQDN }}_error.log;
+
+            client_max_body_size 512m;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_read_timeout  3600;
+            proxy_send_timeout  3600;
+            proxy_buffering     off;
+
+            # CalDAV/CardDAV redirects
+            location = /.well-known/carddav { return 301 /remote.php/dav; }
+            location = /.well-known/caldav  { return 301 /remote.php/dav; }
+
+            location / {
+                proxy_pass http://nextcloud_backend;
+            }
+        }
+
+- name: "Nextcloud | Reload nginx"
+  become: true
+  ansible.builtin.systemd:
+      name: nginx
+      state: reloaded
+
+# -------------------------------------------------------
+# Install + configure via occ
+# -------------------------------------------------------
+
+- name: "Nextcloud | Wait: webroot populated (versioncheck.php exists)"
+  become: true
+  become_user: nextcloud
+  ansible.builtin.command:
+    cmd: >-
+      bash -lc
+      'cd /tmp && podman exec --user 0 nextcloud test -f /var/www/html/lib/versioncheck.php'
+  register: nextcloud_webroot_guard
+  retries: 30
+  delay: 2
+  until: nextcloud_webroot_guard.rc == 0
+  changed_when: false
+
+- name: "Nextcloud | Check install state (occ status)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+    bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ status'
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  register: nextcloud_install_check
+  changed_when: false
+  failed_when: false
+
+- name: "Nextcloud | Derive install state"
+  ansible.builtin.set_fact:
+    nextcloud_not_installed: >-
+      {{ (nextcloud_install_check.rc != 0)
+         or ('installed: true' not in (nextcloud_install_check.stdout | lower)) }}
+
+- name: "Nextcloud | Fix permissions for config + data inside container (pre-install)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >-
+    podman exec --user root nextcloud sh -lc
+    "install -d -m 0755 /var/www/html;
+     install -d -o www-data -g www-data -m 0770 /var/www/html/data /var/www/html/config;
+     chown -R www-data:www-data /var/www/html/data /var/www/html/config"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "Nextcloud | Probe install status (occ status)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+    bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ status'
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  register: nextcloud_occ_status
+  changed_when: false
+  failed_when: false
+
+- name: "Nextcloud | Set nextcloud_not_installed from occ status"
+  ansible.builtin.set_fact:
+    nextcloud_not_installed: >-
+      {{
+        (nextcloud_occ_status.rc != 0)
+        or ('installed: false' in (nextcloud_occ_status.stdout | lower))
+        or ('not installed' in (nextcloud_occ_status.stdout | lower))
+      }}
+
+- name: "Nextcloud | Install if not installed (Postgres)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+      bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ maintenance:install --no-interaction --admin-user="{{ NEXTCLOUD_ADMIN_USER }}" --admin-pass="{{ NEXTCLOUD_ADMIN_PASS }}" --database="pgsql" --database-host="host.containers.internal" --database-port="{{ DBPORT | int }}" --database-name="{{ NEXTCLOUD_DB_NAME }}" --database-user="{{ DBUSERNAME }}" --database-pass="{{ DBUSERPASS }}" --data-dir="/var/www/html/data"'
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  when: nextcloud_not_installed | bool
+  changed_when: true
+
+- name: "Nextcloud | Re-check install state after install (occ status)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+    bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ status'
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  register: nextcloud_install_check_after
+  changed_when: false
+  failed_when: false
+
+- name: "Nextcloud | Set trusted domain + https overwrite"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+    bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ config:system:set trusted_domains 0 --value="{{ NEXTCLOUD_FQDN }}" && podman exec --user www-data nextcloud php /var/www/html/occ config:system:set overwriteprotocol --value="https" && podman exec --user www-data nextcloud php /var/www/html/occ config:system:set overwrite.cli.url --value="https://{{ NEXTCLOUD_FQDN }}"'
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  when: >
+    (nextcloud_install_check_after.rc == 0)
+    and ('installed: true' in (nextcloud_install_check_after.stdout | lower))
+  changed_when: false
+
+- name: "Nextcloud | Update container CA trust store"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+    bash -lc 'podman exec --user root nextcloud update-ca-certificates'
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "nextcloud | Configure richdocuments app settings"
+  become: true
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - -Hiu
+      - nextcloud
+      - podman
+      - exec
+      - --user
+      - "0"
+      - nextcloud
+      - php
+      - /var/www/html/occ
+      - config:app:set
+      - richdocuments
+      - "{{ item.key }}"
+      - "--value={{ item.value }}"
+  loop:
+    - key: wopi_url
+      value: "https://collabora.{{ DOMAIN }}"
+    - key: public_wopi_url
+      value: "https://collabora.{{ DOMAIN }}"
+    - key: wopi_allowlist
+      value: "{{ WG_SERVER_IP }}"
+  args:
+    chdir: "/tmp"
+  changed_when: false
+
+- name: "Nextcloud | Install + enable Nextcloud Office app (richdocuments)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+      bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ app:install richdocuments || true && podman exec --user www-data nextcloud php /var/www/html/occ app:enable richdocuments || true'
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "Nextcloud | Point Nextcloud Office at Collabora (CODE)"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+      bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ config:app:set richdocuments wopi_url --value="{{ NEXTCLOUD_OFFICE_URL }}"'
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+########################
+### Install Maps app ###
+########################
+- name: "Nextcloud | Install Maps app if missing"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+      bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ app:install maps || true'
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+- name: "Nextcloud | Enable Maps app"
+  become: true
+  become_user: "{{ NEXTCLOUD_USER }}"
+  ansible.builtin.command: >
+      bash -lc 'podman exec --user www-data nextcloud php /var/www/html/occ app:enable maps || true'
+  environment:
+      XDG_RUNTIME_DIR: "/run/user/{{ nextcloud_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ nextcloud_uid.stdout }}/bus"
+  changed_when: false
+
+###############################################################################
+# Nextcloud Maps | Configure public tile provider
+#
+# Purpose:
+#     Use a public tile server for Nextcloud Maps instead of hosting
+#     TileServer GL locally.
+#
+# Placement:
+#     Put this section immediately after the Nextcloud Maps app install/enable
+#     tasks.
+#
+# Result:
+#     Nextcloud Maps will load map tiles from the public provider, while
+#     favorites / POIs / tracks remain stored in your self-hosted Nextcloud.
+###############################################################################
+
+- name: "Nextcloud Maps | Set tile provider defaults"
+  ansible.builtin.set_fact:
+    MAPS_TILE_URL: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+    MAPS_TILE_ATTRIBUTION: "© OpenStreetMap contributors © CARTO"
+
+- name: "Nextcloud Maps | Configure tile server URL"
+  become: true
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - -Hiu
+      - nextcloud
+      - podman
+      - exec
+      - --user
+      - "0"
+      - nextcloud
+      - php
+      - /var/www/html/occ
+      - config:app:set
+      - maps
+      - tile_server_url
+      - "--value={{ MAPS_TILE_URL }}"
+  changed_when: false
+
+- name: "Nextcloud Maps | Configure tile attribution"
+  become: true
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - -Hiu
+      - nextcloud
+      - podman
+      - exec
+      - --user
+      - "0"
+      - nextcloud
+      - php
+      - /var/www/html/occ
+      - config:app:set
+      - maps
+      - tile_server_attribution
+      - "--value={{ MAPS_TILE_ATTRIBUTION }}"
+  changed_when: false
+
+- name: "Nextcloud Maps | Show configured tile URL"
+  ansible.builtin.debug:
+    msg:
+      - "Nextcloud Maps now uses public tiles from:"
+      - "{{ MAPS_TILE_URL }}"

@@ -1,0 +1,554 @@
+---
+#######################################
+###########Postgres setup ################
+#######################################
+- name: Configure PostgreSQL YUM repository
+  ansible.builtin.yum_repository:
+    name: pgdg
+    description: "PostgreSQL RPM repository"
+    baseurl: "https://download.postgresql.org/pub/repos/yum/{{ PGVERSION }}/redhat/rhel-{{ ansible_distribution_major_version }}-x86_64/"
+    enabled: yes
+    gpgcheck: yes
+    gpgkey: "https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL"
+    sslverify: yes
+
+- name: Refresh DNF cache
+  ansible.builtin.dnf:
+    update_cache: yes
+
+- name: Check if PostgreSQL module exists
+  shell: dnf module list postgresql -q
+  register: pg_module_check
+  failed_when: false
+  changed_when: false
+
+- name: Disable built-in PostgreSQL module if available
+  shell: dnf -qy module disable postgresql
+  when: pg_module_check.rc == 0
+  args:
+    warn: false
+
+- name: Install PostgreSQL packages (including CRB)
+  dnf:
+    name:
+      - postgresql{{ PGVERSION }}-server
+      - postgresql{{ PGVERSION }}-devel
+      - postgresql{{ PGVERSION }}-contrib
+      - epel-release
+      - perl-IPC-Run
+      - perl
+      - libpq-devel
+      - python3-devel
+    state: present
+    enablerepo: crb
+
+- name: Stop PostgreSQL service if it’s running
+  ansible.builtin.systemd:
+    name: postgresql-{{ PGVERSION }}
+    state: stopped
+  ignore_errors: yes     # in case it’s not yet installed or already stopped
+
+# Ensure the PostgreSQL data directory exists (fixes restorecon failure)  # Edit by ChatGPT
+- name: Create data directory  # Edit by ChatGPT
+  ansible.builtin.file:
+    path: "{{ BLOCKDEV }}/pgdata"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0700'
+
+# Safety check: ensure exactly one fstab line for this mountpoint  # Edit by ChatGPT
+- name: Assert fstab has exactly one /mnt/datavol entry  # Edit by ChatGPT
+  ansible.builtin.shell: "grep -cE '\\s/mnt/datavol\\s' /etc/fstab || true"  # Edit by ChatGPT
+  register: fstab_count  # Edit by ChatGPT
+  changed_when: false  # Edit by ChatGPT
+  failed_when: (fstab_count.stdout | int) != 1  # Edit by ChatGPT
+
+- name: Ensure systemd service drop-in directory exists
+  file:
+    path: "/etc/systemd/system/postgresql-{{ PGVERSION }}.service.d"
+    state: directory
+    mode: '0755'
+
+- name: Configure PGDATA override in systemd drop-in
+  copy:
+    dest: "/etc/systemd/system/postgresql-{{ PGVERSION }}.service.d/override.conf"
+    content: |
+      [Service]
+      Environment=PGDATA={{ BLOCKDEV }}/pgdata
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Label database directory for SELinux
+  sefcontext:
+    target: '{{ BLOCKDEV }}/pgdata(/.*)?'
+    setype: postgresql_db_t
+    state: present
+
+- name: Restore SELinux context on database files
+  command: restorecon -Rv {{ BLOCKDEV }}/pgdata
+
+- name: Initialize PostgreSQL database
+  become_user: postgres
+  shell: |
+    echo "{{ DBSUPERPASS }}" > /tmp/pg_super_pass.txt
+    /usr/pgsql-{{ PGVERSION }}/bin/initdb -D {{ BLOCKDEV }}/pgdata \
+      --username=postgres \
+      --encoding=UTF8 \
+      --locale=en_US.UTF-8 \
+      --auth-local=scram-sha-256 \
+      --auth-host=scram-sha-256 \
+      --pwfile=/tmp/pg_super_pass.txt
+  args:
+    creates: "{{ BLOCKDEV }}/pgdata/PG_VERSION"
+
+- name: Remove temporary password file
+  file:
+    path: /tmp/pg_super_pass.txt
+    state: absent
+
+- name: Start and enable PostgreSQL
+  systemd:
+    name: postgresql-{{ PGVERSION }}
+    enabled: yes
+    state: restarted
+
+- name: Create .zshrc PG vars
+  blockinfile:
+    path: /home/{{ ADMINUSER }}/.zshrc.d/vars.zsh
+    create: yes
+    block: |
+      # Postgres vars
+      export PGDATA=""{{ BLOCKDEV }}/pgdata""
+      export PGHOST="localhost"
+      export PGPORT="{{ DBPORT }}"
+      export PGLOG="/var/log/pgsql"
+    marker: ""
+
+- name: More .zshrc.d extension
+  blockinfile:
+    path: /home/{{ ADMINUSER }}/.zshrc.d/vars.zsh
+    create: yes
+    block: |
+      # Write commands to the history file immediately
+      setopt INC_APPEND_HISTORY
+      # Share history across all running zsh sessions
+      setopt SHARE_HISTORY
+      #  Use an alias to make dd always use `status=progress`
+      alias dd='dd status=progress'
+    marker: ""
+
+- name: Install psycopg2 using pip
+  pip:
+    name: psycopg2-binary
+    state: latest
+    executable: pip3
+
+- name: Set postgres password
+  become_user: postgres
+  environment:
+    PGPASSWORD: "{{ DBSUPERPASS }}"
+  postgresql_user:
+    name: postgres
+    password: "{{ DBSUPERPASS }}"
+    encrypted: yes
+
+- name: Create application DB users
+  become_user: postgres
+  environment:
+    PGPASSWORD: "{{ DBSUPERPASS }}"
+  postgresql_user:
+    name: "{{ item.user }}"
+    password: "{{ DBUSERPASS }}"
+    encrypted: yes
+    state: present
+  loop: "{{ POSTGRES.databases }}"
+  when: POSTGRES.enabled | bool
+
+- name: Create application databases
+  become_user: postgres
+  environment:
+    PGPASSWORD: "{{ DBSUPERPASS }}"
+  postgresql_db:
+    name: "{{ item.name }}"
+    owner: "{{ item.user }}"
+    state: present
+  loop: "{{ POSTGRES.databases }}"
+  when: POSTGRES.enabled | bool
+
+- name: Allow PostgreSQL from home IP (LOCALIP) in UFW
+  community.general.ufw:
+    rule: allow
+    from_ip: "{{ LOCALIP }}"
+    port: "{{ DBPORT }}"
+    proto: tcp
+
+- name: Allow PostgreSQL from VPN IP (VPNIP) in UFW
+  community.general.ufw:
+    rule: allow
+    from_ip: "{{ VPNIP }}"
+    port: "{{ DBPORT }}"
+    proto: tcp
+
+
+- name: Verify SELinux mapping for sshd port
+  command: bash -lc "semanage port -l | grep -w ssh_port_t | grep -w 7312"
+  register: selinux_ssh_port
+  changed_when: false
+  failed_when: false
+
+
+#############################
+#### DB certificates ##########
+#############################
+
+# TLS certificate generation using shell-based OpenSSL commands to avoid chattr issues
+- name: Create temporary directory for certificate generation
+  ansible.builtin.file:
+    path: /tmp/postgres-certs
+    state: directory
+    mode: '0750'
+    owner: postgres
+    group: postgres
+
+- name: Generate CA private key
+  ansible.builtin.command: openssl genrsa -out /tmp/postgres-certs/ca.key 2048
+  args:
+    creates: /tmp/postgres-certs/ca.key
+
+- name: Generate CA self-signed certificate
+  ansible.builtin.command: >
+    openssl req -x509 -new -nodes
+    -key /tmp/postgres-certs/ca.key
+    -sha256 -days 3650
+    -subj "/C={{ COUNTRY }}/O={{ DOMAIN }}/CN=MyDB Root CA"
+    -out /tmp/postgres-certs/ca.crt
+  args:
+    creates: /tmp/postgres-certs/ca.crt
+
+- name: Generate server private key
+  ansible.builtin.command: openssl genrsa -out /tmp/postgres-certs/server.key 2048
+  args:
+    creates: /tmp/postgres-certs/server.key
+
+- name: Generate server CSR
+  ansible.builtin.command: >
+    openssl req -new
+    -key /tmp/postgres-certs/server.key
+    -subj "/C={{ COUNTRY }}/O={{ DOMAIN }}/CN={{ DOMAIN }}/emailAddress={{ EMAIL }}"
+    -out /tmp/postgres-certs/server.csr
+  args:
+    creates: /tmp/postgres-certs/server.csr
+
+- name: Create server v3 extension file
+  ansible.builtin.copy:
+    dest: /tmp/postgres-certs/server_v3.ext
+    content: |
+      [ v3_req ]
+      basicConstraints = CA:FALSE
+      keyUsage = digitalSignature, keyEncipherment
+      extendedKeyUsage = serverAuth
+      subjectAltName = DNS:{{ DOMAIN }}
+    owner: postgres
+    group: postgres
+    mode: '0644'
+
+- name: Sign server certificate with CA
+  ansible.builtin.command: >
+    openssl x509 -req
+    -in /tmp/postgres-certs/server.csr
+    -CA /tmp/postgres-certs/ca.crt
+    -CAkey /tmp/postgres-certs/ca.key
+    -CAcreateserial
+    -out /tmp/postgres-certs/server.crt
+    -days 3650
+    -sha256
+    -extfile /tmp/postgres-certs/server_v3.ext
+    -extensions v3_req
+  args:
+    creates: /tmp/postgres-certs/server.crt
+
+- name: Generate client private key
+  ansible.builtin.command: openssl genrsa -out /tmp/postgres-certs/postgresql.key 2048
+  args:
+    creates: /tmp/postgres-certs/postgresql.key
+
+- name: Generate client CSR
+  ansible.builtin.command: >
+    openssl req -new
+    -key /tmp/postgres-certs/postgresql.key
+    -subj "/C={{ COUNTRY }}/O={{ DOMAIN }}/CN={{ DBUSERNAME }}"
+    -out /tmp/postgres-certs/postgresql.csr
+  args:
+    creates: /tmp/postgres-certs/postgresql.csr
+
+- name: Create client v3 extension file
+  ansible.builtin.copy:
+    dest: /tmp/postgres-certs/client_v3.ext
+    content: |
+      [ v3_req ]
+      basicConstraints = CA:FALSE
+      keyUsage = digitalSignature
+      extendedKeyUsage = clientAuth
+    owner: postgres
+    group: postgres
+    mode: '0644'
+
+- name: Sign client certificate with CA
+  ansible.builtin.command: >
+    openssl x509 -req
+    -in /tmp/postgres-certs/postgresql.csr
+    -CA /tmp/postgres-certs/ca.crt
+    -CAkey /tmp/postgres-certs/ca.key
+    -CAcreateserial
+    -out /tmp/postgres-certs/postgresql.crt
+    -days 3650
+    -sha256
+    -extfile /tmp/postgres-certs/client_v3.ext
+    -extensions v3_req
+  args:
+    creates: /tmp/postgres-certs/postgresql.crt
+
+- name: Move certificates into PostgreSQL data directory
+  ansible.builtin.copy:
+    src: "/tmp/postgres-certs/{{ item }}"
+    dest: "{{ BLOCKDEV }}/pgdata/{{ item }}"
+    remote_src: yes
+    owner: postgres
+    group: postgres
+    mode: "{{ '0600' if item.endswith('.key') else '0644' }}"
+  loop:
+    - ca.crt
+    - ca.key
+    - server.crt
+    - server.key
+    - postgresql.crt
+    - postgresql.key
+
+- name: Copy client key to /tmp for download
+  ansible.builtin.copy:
+    src: "{{ BLOCKDEV }}/pgdata/postgresql.key"
+    dest: /tmp/postgresql.key
+    remote_src: yes
+    owner: "{{ APPUSER }}"
+    group: "{{ APPUSER }}"
+    mode: '0600'
+
+- name: Copy client cert to /tmp for download
+  ansible.builtin.copy:
+    src: "{{ BLOCKDEV }}/pgdata/postgresql.crt"
+    dest: /tmp/postgresql.crt
+    remote_src: yes
+    owner: "{{ APPUSER }}"
+    group: "{{ APPUSER }}"
+    mode: '0644'
+
+- name: Copy root CA to /tmp for download
+  ansible.builtin.copy:
+    src: "{{ BLOCKDEV }}/pgdata/ca.crt"
+    dest: /tmp/postgresql_root.crt
+    remote_src: yes
+    owner: "{{ APPUSER }}"
+    group: "{{ APPUSER }}"
+    mode: '0644'
+
+#####################################
+######### DB authentication ##########
+#####################################
+- name: Update postgresql.conf
+  blockinfile:
+    path: "{{ BLOCKDEV }}/pgdata/postgresql.conf"
+    block: |
+      listen_addresses = '0.0.0.0'
+      port = {{ DBPORT }}
+      ssl = on
+      ssl_cert_file = 'server.crt'
+      ssl_key_file = 'server.key'
+      ssl_ca_file = 'ca.crt'
+      ssl_min_protocol_version = 'TLSv1.3'
+    marker: ""
+
+- name: Configure pg_hba.conf
+  blockinfile:
+    path: "{{ BLOCKDEV }}/pgdata/pg_hba.conf"
+    block: |
+      local   all             all                                     scram-sha-256
+      host    all             all             127.0.0.1/32            scram-sha-256
+      hostssl    all             all             {{ VPNIP }}/32            scram-sha-256
+      hostssl    all             all             {{ LOCALIP }}/32            scram-sha-256
+      hostssl    all             all             169.254.0.0/16            scram-sha-256 # Apparently Podman uses this range for host-containers to talk to the host, so allow PG access from here for rootless containers to connect via VPNIP/LOCALIP routes
+      host    all             all             {{ WG_SUBNET_CIDR }}            scram-sha-256
+    marker: ""
+
+- name: Restart PostgreSQL after config
+  systemd:
+    name: postgresql-{{ PGVERSION }}
+    state: restarted
+
+
+##############################
+######## DB backups #########
+#############################
+
+- name: "Postgres backup | Set backup vars"
+  ansible.builtin.set_fact:
+    PG_BACKUP_DIR: "{{ PG_BACKUP_DIR | default(BLOCKDEV ~ '/pgbackups') }}"
+    PG_BACKUP_AWS_PROFILE: "{{ PG_BACKUP_AWS_PROFILE | default('backblaze') }}"
+    PG_BACKUP_SCHEDULE: "{{ PG_BACKUP_SCHEDULE | default('*-*-* 04:54:45') }}"
+    PG_BACKUP_DBS: "{{ POSTGRES.databases | map(attribute='name') | list }}"
+
+- name: "Postgres backup | Ensure backup directory exists"
+  become: true
+  ansible.builtin.file:
+    path: "{{ PG_BACKUP_DIR }}"
+    state: directory
+    owner: "{{ ADMINUSER }}"
+    group: "{{ ADMINUSER }}"
+    mode: "0700"
+
+- name: "Postgres backup | Install backup script"
+  become: true
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/pg_b2_backup.sh
+    owner: root
+    group: root
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      export HOME="/home/{{ ADMINUSER }}"
+      export PATH="/home/{{ ADMINUSER }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+      backup_dir="{{ PG_BACKUP_DIR }}"
+      bucket="{{ BACKUPBUCKET }}"
+      endpoint="https://{{ B2ENDPOINT }}"
+      profile="{{ PG_BACKUP_AWS_PROFILE }}"
+      region="{{ B2ENDPOINT.split('.')[1] }}"
+      port="{{ DBPORT }}"
+      pg_user="postgres"
+      pg_password={{ DBSUPERPASS | quote }}
+      host_name="{{ ansible_hostname }}"
+      today="$(date +%F)"
+      remote_prefix="${host_name}_${today}"
+
+      mkdir -p "$backup_dir"
+
+      dbs=(
+      {% for db in PG_BACKUP_DBS %}
+          "{{ db }}"
+      {% endfor %}
+      )
+
+      export PGPASSWORD="$pg_password"
+
+      for db in "${dbs[@]}"; do
+          outfile="${backup_dir}/${db}_${today}.dump.gz"
+
+          pg_dump \
+              -h 127.0.0.1 \
+              -p "$port" \
+              -U "$pg_user" \
+              -d "$db" \
+              -Fc \
+          | gzip -9 > "$outfile"
+
+          aws s3 cp \
+              --profile "$profile" \
+              --region "$region" \
+              --endpoint-url="$endpoint" \
+              --cli-connect-timeout 10 \
+              --cli-read-timeout 20 \
+              "$outfile" \
+              "s3://${bucket}/${remote_prefix}/$(basename "$outfile")"
+      done
+
+      unset PGPASSWORD
+
+- name: "Postgres backup | Install systemd service"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/pg-b2-backup.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Nightly PostgreSQL backups to Backblaze B2
+      Wants=network-online.target
+      After=network-online.target postgresql-{{ PGVERSION }}.service
+
+      [Service]
+      Type=oneshot
+      User={{ ADMINUSER }}
+      Group={{ ADMINUSER }}
+      WorkingDirectory=/home/{{ ADMINUSER }}
+      Environment=HOME=/home/{{ ADMINUSER }}
+      Environment=PATH=/home/{{ ADMINUSER }}/.local/bin:/usr/local/bin:/usr/bin:/bin
+      ExecStart=/usr/local/sbin/pg_b2_backup.sh
+
+- name: "Postgres backup | Install systemd timer"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/pg-b2-backup.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run nightly PostgreSQL backups to Backblaze B2
+
+      [Timer]
+      OnCalendar={{ PG_BACKUP_SCHEDULE }}
+      Persistent=true
+      Unit=pg-b2-backup.service
+
+      [Install]
+      WantedBy=timers.target
+
+- name: "Postgres backup | Reload systemd"
+  become: true
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: "Postgres backup | Enable and start timer"
+  become: true
+  ansible.builtin.systemd:
+    name: pg-b2-backup.timer
+    enabled: true
+    state: started
+
+#############################
+# 1) Find & fetch backup_key.* under the home directory
+- name: Find S3 backup key files
+  find:
+    paths: "/home/{{ ADMINUSER }}"
+    patterns: "backup_key.*"
+    recurse: no
+  register: backup_keys
+
+- name: Fetch each S3 backup key
+  fetch:
+    src: "{{ item.path }}"
+    dest: "{{ local_secret_dir | default('../Secret') }}/"
+    flat: yes
+  loop: "{{ backup_keys.files }}"
+
+# 2) Find & fetch postgresql* under /tmp
+- name: Find PostgreSQL credential files in /tmp
+  find:
+    paths: /tmp
+    patterns: "postgresql*"
+    recurse: no
+  register: pg_cred_files
+
+- name: Fetch each PostgreSQL credential file
+  fetch:
+    src: "{{ item.path }}"
+    dest: "{{ local_secret_dir | default('../Secret') }}/"
+    flat: yes
+  loop: "{{ pg_cred_files.files }}"
+#############################

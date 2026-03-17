@@ -1,0 +1,346 @@
+---
+- name: Joplin | Set derived vars / defaults
+  ansible.builtin.set_fact:
+    JOPLIN_USER: "{{ JOPLIN_USER | default('joplin') }}"
+    JOPLIN_FQDN: "{{ JOPLIN_FQDN | default('joplin.' ~ DOMAIN) }}"
+
+    # Rootless quadlet location (per-user)
+    JOPLIN_QUADLET_DIR: "{{ JOPLIN_QUADLET_DIR | default('/home/' ~ (JOPLIN_USER | default('joplin')) ~ '/.config/containers/systemd') }}"
+
+    # Host paths
+    JOPLIN_ENV_DIR: "{{ JOPLIN_ENV_DIR | default('/etc/joplin-server') }}"
+    JOPLIN_ENV_FILE: "{{ JOPLIN_ENV_FILE | default('/etc/joplin-server/joplin.env') }}"
+    JOPLIN_STORAGE_DIR: "{{ JOPLIN_STORAGE_DIR | default('/var/lib/joplin-server') }}"
+
+    # Networking
+    JOPLIN_LISTEN_HOST: "{{ JOPLIN_LISTEN_HOST | default('127.0.0.1') }}"
+    JOPLIN_LISTEN_PORT: "{{ JOPLIN_LISTEN_PORT | default('22300') }}"
+
+    # Container
+    JOPLIN_IMAGE: "{{ JOPLIN_IMAGE | default('docker.io/joplin/server:latest') }}"
+    JOPLIN_SERVICE_NAME: "{{ JOPLIN_SERVICE_NAME | default('joplin-server') }}"
+
+    # Postgres (host)
+    JOPLIN_DB_NAME: "{{ JOPLIN_DB_NAME | default('joplin') }}"
+    JOPLIN_DB_USER: "{{ JOPLIN_DB_USER | default('joplin') }}"
+    JOPLIN_DB_HOST: "{{ JOPLIN_DB_HOST | default('127.0.0.1') }}"
+    # Postgres (host)
+    JOPLIN_DB_PORT: "{{ JOPLIN_DB_PORT | default(DBPORT) }}"
+
+    
+
+- name: Joplin | Assert required vars
+  ansible.builtin.assert:
+    that:
+      - DOMAIN is defined
+      - JOPLIN_DB_PASSWORD is defined
+      - DBSUPERPASS is defined
+    fail_msg: "You must define DOMAIN, JOPLIN_DB_PASSWORD, and DBSUPERPASS."
+
+- name: Joplin | Ensure joplin user exists
+  ansible.builtin.user:
+    name: "{{ JOPLIN_USER }}"
+    create_home: true
+    shell: /bin/bash
+    system: true
+
+# - name: Joplin | Enable linger for rootless user services
+#   ansible.builtin.command: "loginctl enable-linger {{ JOPLIN_USER }}"
+#   changed_when: false
+
+- name: Joplin | Ensure env dir exists (readable by {{ JOPLIN_USER }})
+  ansible.builtin.file:
+    path: "{{ JOPLIN_ENV_DIR }}"
+    state: directory
+    owner: root
+    group: "{{ JOPLIN_USER }}"
+    mode: "0750"
+
+- name: Joplin | Ensure storage dir exists (host filesystem storage)
+  ansible.builtin.file:
+    path: "{{ JOPLIN_STORAGE_DIR }}:Z,U"
+    state: directory
+    owner: "{{ JOPLIN_USER }}"
+    group: "{{ JOPLIN_USER }}"
+    mode: "0750"
+
+- name: "Joplin | Detect container runtime UID (for storage ownership mapping)"
+  become: true
+  become_user: "{{ JOPLIN_USER }}"
+  ansible.builtin.command: >-
+    podman run --rm --entrypoint sh {{ JOPLIN_IMAGE }}
+    -c 'id -u'
+  register: joplin_container_uid
+  changed_when: false
+
+- name: "Joplin | Map storage dir ownership for rootless container user (podman unshare chown)"
+  become: true
+  become_user: "{{ JOPLIN_USER }}"
+  ansible.builtin.command: >-
+    podman unshare chown -R
+    {{ joplin_container_uid.stdout | trim }}:{{ joplin_container_uid.stdout | trim }}
+    {{ JOPLIN_STORAGE_DIR }}
+  changed_when: false
+
+- name: "Joplin | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "Joplin | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: joplin_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "Joplin | Postgres: allow podman subnet (joplin -> joplin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ joplin_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ JOPLIN_DB_NAME }}"
+        users: "{{ JOPLIN_DB_USER }}"
+        source: "{{ JOPLIN_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: JOPLIN_PODMAN_SUBNET is defined
+
+    - name: "Joplin | Postgres: allow podman subnet (postgres -> joplin db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ joplin_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ JOPLIN_DB_NAME }}"
+        users: postgres
+        source: "{{ JOPLIN_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: JOPLIN_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "Joplin | Postgres: allow samehost (joplin -> joplin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ joplin_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ JOPLIN_DB_NAME }}"
+        users: "{{ JOPLIN_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Joplin | Postgres: allow samehost (postgres -> joplin db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ joplin_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ JOPLIN_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Joplin | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "Joplin | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ JOPLIN_DB_USER }}"
+        password: "{{ JOPLIN_DB_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "Joplin | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ JOPLIN_DB_NAME }}"
+        owner: "{{ JOPLIN_DB_USER }}"
+        state: present
+
+
+- name: Joplin | Write env file (readable by {{ JOPLIN_USER }})
+  ansible.builtin.copy:
+    dest: "{{ JOPLIN_ENV_FILE }}"
+    owner: root
+    group: "{{ JOPLIN_USER }}"
+    mode: "0640"
+    content: |
+      # Joplin Server
+      APP_BASE_URL=https://{{ JOPLIN_FQDN }}
+      APP_PORT=22300
+      APP_BIND_ADDRESS=0.0.0.0
+
+      # Host PostgreSQL
+      DB_CLIENT=pg
+      POSTGRES_HOST={{ JOPLIN_DB_HOST }}
+      POSTGRES_PORT={{ DBPORT }}
+      POSTGRES_DATABASE={{ JOPLIN_DB_NAME }}
+      POSTGRES_USER={{ JOPLIN_DB_USER }}
+      POSTGRES_PASSWORD={{ JOPLIN_DB_PASSWORD }}
+      STORAGE_DRIVER=Type=Filesystem; Path={{ JOPLIN_STORAGE_DIR }}
+
+- name: Joplin | Ensure quadlet dir exists (rootless)
+  ansible.builtin.file:
+    path: "{{ JOPLIN_QUADLET_DIR }}"
+    state: directory
+    owner: "{{ JOPLIN_USER }}"
+    group: "{{ JOPLIN_USER }}"
+    mode: "0755"
+
+- name: Joplin | Install quadlet container unit (rootless)
+  ansible.builtin.copy:
+    dest: "{{ JOPLIN_QUADLET_DIR }}/{{ JOPLIN_SERVICE_NAME }}.container"
+    owner: "{{ JOPLIN_USER }}"
+    group: "{{ JOPLIN_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=joplin
+      Image={{ JOPLIN_IMAGE }}
+      EnvironmentFile={{ JOPLIN_ENV_FILE }}
+
+      # Bind only to localhost on the host
+      PublishPort={{ JOPLIN_LISTEN_HOST }}:{{ JOPLIN_LISTEN_PORT }}:22300
+
+      # Storage dir must match STORAGE_DRIVER Path
+      Volume={{ JOPLIN_STORAGE_DIR }}:{{ JOPLIN_STORAGE_DIR }}:Z,U
+
+      [Service]
+      Restart=always
+
+      [Install]
+      WantedBy=default.target
+
+- name: "Joplin | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+    - name: "Joplin | Get UID of {{ JOPLIN_USER }}"
+      ansible.builtin.command: "id -u {{ JOPLIN_USER }}"
+      register: joplin_uid
+      changed_when: false
+
+    - name: "Joplin | Set runtime facts"
+      ansible.builtin.set_fact:
+        JOPLIN_UID: "{{ joplin_uid.stdout | trim }}"
+        JOPLIN_XDG_RUNTIME_DIR: "/run/user/{{ joplin_uid.stdout | trim }}"
+        JOPLIN_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ joplin_uid.stdout | trim }}/bus"
+
+    - name: "Joplin | Ensure XDG runtime dir exists"
+      ansible.builtin.file:
+        path: "{{ JOPLIN_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ JOPLIN_USER }}"
+        group: "{{ JOPLIN_USER }}"
+        mode: "0700"
+
+    - name: "Joplin | Ensure user manager is started (user@UID)"
+      ansible.builtin.systemd:
+        name: "user@{{ JOPLIN_UID }}.service"
+        state: started
+  become: true
+
+
+- name: "Joplin | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ JOPLIN_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ JOPLIN_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ JOPLIN_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+
+- name: "Joplin | Start container service (generated; do not enable)"
+  block:
+    - name: "Joplin | Start service"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ JOPLIN_USER }}@.host --user
+          start {{ JOPLIN_SERVICE_NAME }}.service
+      changed_when: false
+
+  rescue:
+    - name: "Joplin | Status (for debugging)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ JOPLIN_USER }}@.host
+          status {{ JOPLIN_SERVICE_NAME }}.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: joplin_status
+
+    - name: "Joplin | Journal (for debugging)"
+      ansible.builtin.command:
+        cmd: >-
+          journalctl --user -M {{ JOPLIN_USER }}@.host
+          -xeu {{ JOPLIN_SERVICE_NAME }}.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: joplin_journal
+
+    - name: "Joplin | Show status"
+      ansible.builtin.debug:
+        var: joplin_status.stdout_lines
+
+    - name: "Joplin | Show journal"
+      ansible.builtin.debug:
+        var: joplin_journal.stdout_lines
+
+    - name: "Joplin | Fail after diagnostics"
+      ansible.builtin.fail:
+        msg: "Joplin service failed to start; see debug output above."
+
+- name: Joplin | Write nginx vhost
+  ansible.builtin.copy:
+    dest: "/etc/nginx/conf.d/{{ JOPLIN_FQDN }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ JOPLIN_FQDN }};
+          return 301 https://$host$request_uri;
+      }
+      server {
+          listen {{  WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ JOPLIN_FQDN }};
+
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log /var/log/nginx/{{ JOPLIN_FQDN }}_access.log main;
+          error_log  /var/log/nginx/{{ JOPLIN_FQDN }}_error.log warn;
+          # Joplin can sync sizable payloads
+          client_max_body_size 200m;
+
+          location / {
+              proxy_pass http://{{ JOPLIN_LISTEN_HOST }}:{{ JOPLIN_LISTEN_PORT }};
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              proxy_read_timeout 300s;
+              proxy_send_timeout 300s;
+          }
+      }
+
+- name: Joplin | Reload nginx
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

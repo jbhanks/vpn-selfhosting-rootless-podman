@@ -1,0 +1,500 @@
+---
+###############################################################################
+# Firefly III (rootless podman + quadlet, user-scoped) + nginx vhost
+###############################################################################
+
+- name: Firefly III | Set derived vars / defaults
+  ansible.builtin.set_fact:
+    FIREFLY_HOST: "{{ FIREFLY_HOST | default('firefly3.' ~ DOMAIN) }}"
+    FIREFLY_USER: "{{ FIREFLY_USER | default('firefly3') }}"
+    FIREFLY_IMAGE: "{{ FIREFLY_IMAGE | default('docker.io/fireflyiii/core:latest') }}"
+
+    # Host port (nginx will proxy to this). Container listens on 8080 internally.
+    FIREFLY_HOST_PORT: "{{ FIREFLY_HOST_PORT | default('8484') }}"
+    FIREFLY_CONTAINER_PORT: "{{ FIREFLY_CONTAINER_PORT | default('8080') }}"
+
+    # Data / config paths (host)
+    FIREFLY_DATA_DIR: "{{ FIREFLY_DATA_DIR | default('/opt/firefly3') }}"
+    FIREFLY_ENV_DIR: "{{ FIREFLY_ENV_DIR | default('/etc/firefly3') }}"
+    FIREFLY_ENV_FILE: "{{ FIREFLY_ENV_FILE | default('/etc/firefly3/firefly.env') }}"
+    FIREFLY_QUADLET_DIR: "/home/{{ FIREFLY_USER }}/.config/containers/systemd"
+
+- name: "Firefly III | Preflight: ensure required vars exist"
+  ansible.builtin.assert:
+    that:
+      - DOMAIN is defined
+      - FIREFLY_DB_NAME is defined
+      - FIREFLY_DB_USER is defined
+      - FIREFLY_DB_PASSWORD is defined
+      - DBPORT is defined
+    fail_msg: >-
+      Missing required vars. Ensure DOMAIN, FIREFLY_DB_NAME, FIREFLY_DB_USER,
+      FIREFLY_DB_PASSWORD, DBPORT are present in vars.yml.
+
+#####################################################################
+# Firefly III | Debug: show FIREFLY_APP_KEY state before/after creation
+#####################################################################
+
+- name: "Firefly III | DEBUG | Pre: FIREFLY_APP_KEY status"
+  ansible.builtin.debug:
+    msg:
+      - "FIREFLY_APP_KEY defined? {{ FIREFLY_APP_KEY is defined }}"
+      - "FIREFLY_APP_KEY value: {{ FIREFLY_APP_KEY | default('<UNDEFINED>') }}"
+      - "FIREFLY_APP_KEY == REPLACE_ME_APP_KEY ? {{ (FIREFLY_APP_KEY | default('')) == 'REPLACE_ME_APP_KEY' }}"
+      - "Generation condition evaluates to: {{ (FIREFLY_APP_KEY is not defined) or ((FIREFLY_APP_KEY | default('')) == 'REPLACE_ME_APP_KEY') }}"
+
+- name: "Firefly III | Generate APP_KEY (32 random bytes, base64)"
+  ansible.builtin.command: openssl rand -base64 32
+  register: firefly_key_cmd
+  changed_when: true
+  when: (FIREFLY_APP_KEY is not defined) or ((FIREFLY_APP_KEY | default('')) == 'REPLACE_ME_APP_KEY')
+
+- name: "Firefly III | DEBUG | Post-openssl: did it run?"
+  ansible.builtin.debug:
+    msg:
+      - "firefly_key_cmd is defined? {{ firefly_key_cmd is defined }}"
+      - "openssl stdout length: {{ (firefly_key_cmd.stdout | default('')) | length }}"
+      - "openssl stdout (first 8 chars): {{ (firefly_key_cmd.stdout | default(''))[:8] }}"
+  when: firefly_key_cmd is defined
+
+- name: "Firefly III | Set FIREFLY_APP_KEY fact"
+  ansible.builtin.set_fact:
+    FIREFLY_APP_KEY: "base64:{{ firefly_key_cmd.stdout }}"
+  when: firefly_key_cmd is defined
+
+- name: "Firefly III | DEBUG | Post-set_fact: FIREFLY_APP_KEY status"
+  ansible.builtin.debug:
+    msg:
+      - "FIREFLY_APP_KEY defined? {{ FIREFLY_APP_KEY is defined }}"
+      - "FIREFLY_APP_KEY value prefix: {{ (FIREFLY_APP_KEY | default(''))[:7] }}"
+      - "FIREFLY_APP_KEY total length: {{ (FIREFLY_APP_KEY | default('')) | length }}"
+
+#####################################################################
+# Firefly III | Debug: right before writing env file
+#####################################################################
+
+- name: "Firefly III | DEBUG | Immediately before writing env file"
+  ansible.builtin.debug:
+    msg:
+      - "FIREFLY_APP_KEY value: {{ FIREFLY_APP_KEY | default('<UNDEFINED>') }}"
+      - "Rendered APP_KEY line would be: APP_KEY={{ FIREFLY_APP_KEY | default('<UNDEFINED>') }}"
+  tags: [firefly_debug]
+
+# - name: Firefly III | Generate APP_KEY (32 random bytes)
+#   ansible.builtin.command: openssl rand -base64 32
+#   register: firefly_key_cmd
+#   changed_when: true
+#   when: FIREFLY_APP_KEY is not defined or FIREFLY_APP_KEY == "REPLACE_ME_APP_KEY"
+
+# - name: Firefly III | Set APP_KEY fact
+#   ansible.builtin.set_fact:
+#     FIREFLY_APP_KEY: "base64:{{ firefly_key_cmd.stdout }}"
+#   when: firefly_key_cmd is defined
+
+###############################################################################
+# User + dirs
+###############################################################################
+
+# - name: Firefly III | Ensure service user exists
+#   ansible.builtin.user:
+#     name: "{{ FIREFLY_USER }}"
+#     home: "/home/{{ FIREFLY_USER }}"
+#     shell: /bin/bash
+#     create_home: true
+
+- name: Firefly III | Ensure data directory exists
+  ansible.builtin.file:
+    path: "{{ FIREFLY_DATA_DIR }}"
+    state: directory
+    owner: "{{ FIREFLY_USER }}"
+    group: "{{ FIREFLY_USER }}"
+    mode: "0750"
+
+- name: Firefly III | Ensure env directory exists
+  ansible.builtin.file:
+    path: "{{ FIREFLY_ENV_DIR }}"
+    state: directory
+    owner: root
+    group: "{{ FIREFLY_USER }}"
+    mode: "0750"
+  become: true
+
+- name: "Firefly III | Ensure upload directory exists"
+  ansible.builtin.file:
+    path: "{{ FIREFLY_DATA_DIR }}/upload"
+    state: directory
+    owner: "{{ FIREFLY_USER }}"
+    group: "{{ FIREFLY_USER }}"
+    mode: "0770"
+  become: true
+
+- name: Firefly III | Ensure Quadlet directory exists
+  ansible.builtin.file:
+    path: "{{ FIREFLY_QUADLET_DIR }}"
+    state: directory
+    owner: "{{ FIREFLY_USER }}"
+    group: "{{ FIREFLY_USER }}"
+    mode: "0755"
+
+###############################################################################
+# Firefly env file
+###############################################################################
+
+- name: Firefly III | Write env file
+  ansible.builtin.copy:
+    dest: "{{ FIREFLY_ENV_FILE }}"
+    owner: root
+    group: "{{ FIREFLY_USER }}"
+    mode: "0640"
+    content: |
+      # Core
+      APP_ENV=production
+      APP_DEBUG=false
+      APP_KEY={{ FIREFLY_APP_KEY }}
+
+      # Used in URL generation / validation behind reverse proxy
+      APP_URL=https://{{ FIREFLY_HOST }}
+
+      # Reverse proxy friendliness (recommended in upstream env example)
+      TRUSTED_PROXIES=**
+
+      # Database (PostgreSQL)
+      DB_CONNECTION=pgsql
+      DB_HOST=host.containers.internal
+      DB_PORT={{ DBPORT }}
+      DB_DATABASE={{ FIREFLY_DB_NAME }}
+      DB_USERNAME={{ FIREFLY_DB_USER }}
+      DB_PASSWORD={{ FIREFLY_DB_PASSWORD }}
+
+      # Optional timezone (override if you like)
+      TZ={{ FIREFLY_TZ | default('America/New_York') }}
+  become: true
+
+- name: "Firefly III | DEBUG | Read back env file immediately after write"
+  become: true
+  ansible.builtin.command: cat "{{ FIREFLY_ENV_FILE }}"
+  register: firefly_env_cat
+  changed_when: false
+
+- name: "Firefly III | DEBUG | Env file content (post-write)"
+  ansible.builtin.debug:
+    var: firefly_env_cat.stdout_lines
+
+###############################################################################
+# Quadlet: pod + container
+###############################################################################
+
+- name: Firefly III | Write Quadlet pod file
+  ansible.builtin.copy:
+    dest: "{{ FIREFLY_QUADLET_DIR }}/firefly3.pod"
+    owner: "{{ FIREFLY_USER }}"
+    group: "{{ FIREFLY_USER }}"
+    mode: "0644"
+    content: |
+      [Pod]
+      PodName=firefly3.pod
+      PublishPort=127.0.0.1:{{ FIREFLY_HOST_PORT }}:{{ FIREFLY_CONTAINER_PORT }}
+
+- name: Firefly III | Write Quadlet container file
+  ansible.builtin.copy:
+    dest: "{{ FIREFLY_QUADLET_DIR }}/firefly3.container"
+    owner: "{{ FIREFLY_USER }}"
+    group: "{{ FIREFLY_USER }}"
+    mode: "0644"
+    content: |
+      [Container]
+      ContainerName=firefly3
+      Image={{ FIREFLY_IMAGE }}
+      Pod=firefly3.pod
+
+      EnvironmentFile={{ FIREFLY_ENV_FILE }}
+
+      # Persistent uploads (this is the usual mount point used in container setups)
+      Volume={{ FIREFLY_DATA_DIR }}/upload:/var/www/html/storage/upload
+
+      # If your host Postgres only listens on 127.0.0.1, rootless networking may still reach it via
+      # host.containers.internal (recommended). If that fails, the common fallback is DB_HOST=10.0.2.2.
+
+      [Service]
+      Restart=always
+
+###############################################################################
+# Firefly III | Root controlling rootless (Quadlet-generated; do not enable)
+###############################################################################
+
+- name: "Firefly III | Derive runtime dir for user systemd (root controlling rootless)"
+  block:
+    - name: "Firefly III | Get UID of {{ FIREFLY_USER }}"
+      ansible.builtin.command: "id -u {{ FIREFLY_USER }}"
+      register: firefly_uid
+      changed_when: false
+
+    - name: "Firefly III | Set runtime facts"
+      ansible.builtin.set_fact:
+        FIREFLY_UID: "{{ firefly_uid.stdout | trim }}"
+        FIREFLY_XDG_RUNTIME_DIR: "/run/user/{{ firefly_uid.stdout | trim }}"
+        FIREFLY_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ firefly_uid.stdout | trim }}/bus"
+
+    - name: "Firefly III | Ensure XDG runtime dir exists"
+      ansible.builtin.file:
+        path: "{{ FIREFLY_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ FIREFLY_USER }}"
+        group: "{{ FIREFLY_USER }}"
+        mode: "0700"
+
+    - name: "Firefly III | Assert user manager responds"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ FIREFLY_USER }}@.host is-active default.target
+      become: true
+      changed_when: false
+      register: firefly_user_mgr
+      failed_when: firefly_user_mgr.rc != 0
+
+  become: true
+
+- name: "Firefly III | systemd --user daemon-reload (via machine context)"
+  ansible.builtin.command:
+    cmd: >-
+      systemctl --user -M {{ FIREFLY_USER }}@.host daemon-reload
+  become: true
+  changed_when: false
+
+
+- name: "Firefly III | Debug: list quadlet files"
+  ansible.builtin.command: "ls -la {{ FIREFLY_QUADLET_DIR }}"
+  become: true
+  changed_when: false
+  register: firefly_quadlet_ls
+
+- name: "Firefly III | Show quadlet dir listing"
+  ansible.builtin.debug:
+    var: firefly_quadlet_ls.stdout_lines
+
+# - name: "Firefly III | Debug: list user units (no pipes)"
+#   ansible.builtin.command:
+#     cmd: >-
+#       systemctl --user -M {{ FIREFLY_USER }}@.host
+#       list-units --all --no-pager
+#   become: true
+#   changed_when: false
+#   register: firefly_list_units
+
+# - name: "Firefly III | Show matching units"
+#   ansible.builtin.debug:
+#     var: firefly_list_units.stdout_lines
+
+
+# - name: "Firefly III | Show unit-files output"
+#   ansible.builtin.debug:
+#     var: firefly_unit_files.stdout_lines
+
+# - name: "Firefly III | Assert firefly units exist (from list-units)"
+#   ansible.builtin.assert:
+#     that:
+#       - firefly_list_units.stdout is search("firefly3", ignorecase=True)
+#     fail_msg: >-
+#       systemd --user is running, but no firefly3 units are loaded/generated.
+#       This usually means quadlet isn't generating units from your *.pod/*.container files.
+
+
+- name: "Firefly III | Start services (generated; do not enable)"
+  block:
+  - name: "Firefly III | Start pod (generated; do not enable)"
+    ansible.builtin.command:
+      cmd: >-
+        systemctl --user -M {{ FIREFLY_USER }}@.host start firefly3-pod.service
+    become: true
+    changed_when: false
+
+  - name: "Firefly III | Start container (generated; do not enable)"
+    ansible.builtin.command:
+      cmd: >-
+        systemctl --user -M {{ FIREFLY_USER }}@.host start firefly3.service
+    become: true
+    changed_when: false
+
+  rescue:
+    - name: "Firefly III | Status (debug)"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --user -M {{ FIREFLY_USER }}@.host
+          status firefly3.service firefly3-pod.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: firefly_status
+
+    - name: "Firefly III | Journal (debug)"
+      ansible.builtin.command:
+        cmd: >-
+          journalctl --user -M {{ FIREFLY_USER }}@.host
+          -xeu firefly3.service --no-pager
+      changed_when: false
+      failed_when: false
+      register: firefly_journal
+
+    - name: "Firefly III | Show status"
+      ansible.builtin.debug:
+        var: firefly_status.stdout_lines
+
+    - name: "Firefly III | Show journal"
+      ansible.builtin.debug:
+        var: firefly_journal.stdout_lines
+
+    - name: "Firefly III | Fail after diagnostics"
+      ansible.builtin.fail:
+        msg: "Firefly III service failed to start; see debug output above."
+
+####################################################################
+# Postgres
+#####################################################################
+
+- name: "Firefly | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "Firefly | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: firefly_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "Firefly | Postgres: allow podman subnet (firefly -> firefly)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ firefly_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ FIREFLY_DB_NAME }}"
+        users: "{{ FIREFLY_DB_USER }}"
+        source: "{{ FIREFLY_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: FIREFLY_PODMAN_SUBNET is defined
+
+    - name: "Firefly | Postgres: allow podman subnet (postgres -> firefly db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ firefly_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ FIREFLY_DB_NAME }}"
+        users: postgres
+        source: "{{ FIREFLY_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: FIREFLY_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "Firefly | Postgres: allow samehost (firefly -> firefly)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ firefly_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ FIREFLY_DB_NAME }}"
+        users: "{{ FIREFLY_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Firefly | Postgres: allow samehost (postgres -> firefly db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ firefly_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ FIREFLY_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "Firefly | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "Firefly | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ FIREFLY_DB_USER }}"
+        password: "{{ FIREFLY_DB_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "Firefly | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ FIREFLY_DB_NAME }}"
+        owner: "{{ FIREFLY_DB_USER }}"
+        state: present
+###############################################################################
+# nginx vhost
+###############################################################################
+
+- name: Firefly III | Write nginx vhost
+  block:
+    - name: Firefly III | Remove old placeholder vhost if present
+      ansible.builtin.file:
+        path: "/etc/nginx/conf.d/{{ FIREFLY_HOST }}.conf"
+        state: absent
+
+    - name: Firefly III | Install vhost
+      ansible.builtin.copy:
+        dest: "/etc/nginx/conf.d/{{ FIREFLY_HOST }}.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Redirect http to https
+          server {
+              listen {{ WG_SERVER_IP }}:80;
+              listen [::]:80;
+              server_name {{ FIREFLY_HOST }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen {{ WG_SERVER_IP }}:443 ssl;
+              http2 on;
+              server_name {{ FIREFLY_HOST }};
+
+              include /etc/nginx/default.d/*.conf;
+              ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+              ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+              access_log /var/log/nginx/{{ FIREFLY_HOST }}_access.log main;
+              error_log  /var/log/nginx/{{ FIREFLY_HOST }}_error.log warn;
+
+              client_max_body_size 0;
+              underscores_in_headers on;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ FIREFLY_HOST_PORT }}/;
+
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Port $server_port;
+
+                  proxy_buffering off;
+              }
+          }
+
+    - name: Firefly III | nginx config test
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Firefly III | Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+  become: true

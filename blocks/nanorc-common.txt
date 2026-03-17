@@ -1,0 +1,6 @@
+set constantshow
+set tabsize 4
+set tabstospaces
+set softwrap
+set numbercolor green
+include "/usr/share/nano/*.nanorc"

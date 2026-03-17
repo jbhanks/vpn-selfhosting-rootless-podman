@@ -1,0 +1,11 @@
+[Unit]
+Description=Dashy
+
+[Container]
+Image=docker.io/lissy93/dashy:latest
+ContainerName=dashy
+PublishPort={{ DASHY_BIND }}:{{ DASHY_PORT }}:8080
+Volume={{ DASHY_DATA_DIR }}:/app/user-data:Z
+
+[Install]
+WantedBy=default.target

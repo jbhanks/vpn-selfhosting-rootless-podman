@@ -1,0 +1,323 @@
+---
+- name: XWiki set derived vars defaults
+  ansible.builtin.set_fact:
+    XWIKI_USER: "{{ XWIKI_USER | default('xwiki') }}"
+    XWIKI_DB_NAME: "{{ XWIKI_DB_NAME | default('xwiki') }}"
+    XWIKI_ROOT: "{{ XWIKI_ROOT | default('/opt/xwiki') }}"
+    XWIKI_DATA_DIR: "{{ XWIKI_DATA_DIR | default((XWIKI_ROOT | default('/opt/xwiki')) + '/data') }}"
+    XWIKI_ENV_DIR: "{{ XWIKI_ENV_DIR | default('/etc/xwiki') }}"
+    XWIKI_ENV_FILE: "{{ XWIKI_ENV_FILE | default('/etc/xwiki/xwiki.env') }}"
+    XWIKI_QUADLET_DIR: "{{ XWIKI_QUADLET_DIR | default('/home/' + (XWIKI_USER | default('xwiki')) + '/.config/containers/systemd') }}"
+    XWIKI_SERVICE_NAME: "{{ XWIKI_SERVICE_NAME | default('xwiki') }}"
+    XWIKI_HOST: "{{ XWIKI_HOST | default('xwiki.' ~ DOMAIN) }}"
+
+
+    # Pick a high port to avoid collisions (XWiki inside container listens on 8080).
+    # Override if you know 8080 is free on *this* host.
+    XWIKI_HTTP_PORT: "{{ XWIKI_HTTP_PORT | default(18080) | int }}"
+
+    # Image tag that includes the Postgres JDBC bits.
+    XWIKI_IMAGE: "{{ XWIKI_IMAGE | default('docker.io/library/xwiki:lts-postgres-tomcat') }}"
+    XWIKI_CONTAINER_NAME: "{{ XWIKI_CONTAINER_NAME | default('xwiki') }}"
+
+    # nginx
+    XWIKI_NGINX_CONF: "{{ XWIKI_NGINX_CONF | default('/etc/nginx/conf.d/' + (XWIKI_HOST | default('xwiki.' + DOMAIN)) + '.conf') }}"
+
+- name: XWiki | Derive runtime dir for user systemd (root controlling rootless)
+  block:
+    - name: XWiki | Get UID of {{ XWIKI_USER }}
+      ansible.builtin.command: "id -u {{ XWIKI_USER }}"
+      register: xwiki_uid
+      changed_when: false
+
+    - name: XWiki | Set runtime facts
+      ansible.builtin.set_fact:
+        XWIKI_UID: "{{ xwiki_uid.stdout | trim }}"
+        XWIKI_XDG_RUNTIME_DIR: "/run/user/{{ xwiki_uid.stdout | trim }}"
+        XWIKI_DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ xwiki_uid.stdout | trim }}/bus"
+
+    - name: XWiki | Ensure XDG runtime dir exists
+      ansible.builtin.file:
+        path: "{{ XWIKI_XDG_RUNTIME_DIR }}"
+        state: directory
+        owner: "{{ XWIKI_USER }}"
+        group: "{{ XWIKI_USER }}"
+        mode: "0700"
+
+    - name: XWiki | Ensure user manager is started (user@UID)
+      ansible.builtin.systemd:
+        name: "user@{{ XWIKI_UID }}.service"
+        state: started
+  become: true
+
+####################################################################
+# Postgres
+#####################################################################
+
+- name: "XWiki | Postgres: allow access + create role/db (host Postgres)"
+  block:
+    - name: "XWiki | Postgres: discover pg_hba.conf path"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SHOW hba_file;"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      register: xwiki_hba_file
+      changed_when: false
+
+    # Optional: allow a known podman subnet (only if you track it)
+    - name: "XWiki | Postgres: allow podman subnet (xwiki -> xwiki)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ xwiki_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ XWIKI_DB_NAME }}"
+        users: "{{ XWIKI_DB_USER }}"
+        source: "{{ XWIKI_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: XWIKI_PODMAN_SUBNET is defined
+
+    - name: "XWiki | Postgres: allow podman subnet (postgres -> xwiki db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ xwiki_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ XWIKI_DB_NAME }}"
+        users: postgres
+        source: "{{ XWIKI_PODMAN_SUBNET }}"
+        method: scram-sha-256
+        state: present
+      when: XWIKI_PODMAN_SUBNET is defined
+
+    # Always allow samehost (matches your existing pattern)
+    - name: "XWiki | Postgres: allow samehost (xwiki -> xwiki)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ xwiki_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ XWIKI_DB_NAME }}"
+        users: "{{ XWIKI_DB_USER }}"
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "XWiki | Postgres: allow samehost (postgres -> xwiki db admin)"
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ xwiki_hba_file.stdout | trim }}"
+        contype: host
+        databases: "{{ XWIKI_DB_NAME }}"
+        users: postgres
+        source: samehost
+        method: scram-sha-256
+        state: present
+
+    - name: "XWiki | Postgres: reload config"
+      become: true
+      become_user: postgres
+      ansible.builtin.command: >
+        psql -h 127.0.0.1 -p {{ DBPORT | int }} -U postgres -tAc "SELECT pg_reload_conf();"
+      environment:
+        PGPASSWORD: "{{ DBSUPERPASS }}"
+      changed_when: false
+
+    - name: "XWiki | Postgres: ensure role exists"
+      community.postgresql.postgresql_user:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ XWIKI_DB_USER }}"
+        password: "{{ XWIKI_DB_PASSWORD }}"
+        encrypted: true
+        state: present
+
+    - name: "XWiki | Postgres: ensure database exists"
+      community.postgresql.postgresql_db:
+        login_host: "127.0.0.1"
+        login_port: "{{ DBPORT | int }}"
+        login_user: postgres
+        login_password: "{{ DBSUPERPASS }}"
+        name: "{{ XWIKI_DB_NAME }}"
+        owner: "{{ XWIKI_DB_USER }}"
+        state: present
+
+- name: XWiki ensure service user exists
+  ansible.builtin.user:
+    name: "{{ XWIKI_USER }}"
+    system: true
+    create_home: true
+    shell: /bin/bash
+    state: present
+
+- name: XWiki ensure directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ XWIKI_ROOT }}",      owner: "{{ XWIKI_USER }}", group: "{{ XWIKI_USER }}", mode: "0750" }
+    - { path: "{{ XWIKI_DATA_DIR }}", owner: "{{ XWIKI_USER }}", group: "{{ XWIKI_USER }}", mode: "0750" }
+    - { path: "{{ XWIKI_ENV_DIR }}",  owner: "root",            group: "{{ XWIKI_USER }}", mode: "0750" }
+
+- name: XWiki write env file
+  ansible.builtin.copy:
+    dest: "{{ XWIKI_ENV_FILE }}"
+    owner: root
+    group: "{{ XWIKI_USER }}"
+    mode: "0640"
+    content: |
+      # XWiki container env
+      #
+      # The official image uses these DB_* env vars for DB connectivity. :contentReference[oaicite:1]{index=1}
+      DB_USER={{ XWIKI_DB_USER }}
+      DB_PASSWORD={{ XWIKI_DB_PASSWORD }}
+      DB_DATABASE={{ XWIKI_DB_DATABASE }}
+
+      # Rootless podman containers often reach the host via host.containers.internal
+      # (Podman may add this automatically; if it doesn't work on your host, set XWIKI_DB_HOST explicitly).
+      DB_HOST={{ XWIKI_DB_HOST | default('host.containers.internal') }}
+
+      # Optional: if you run an external Solr, set INDEX_HOST; otherwise XWiki uses embedded Solr by default. :contentReference[oaicite:2]{index=2}
+      # INDEX_HOST=solr.example.internal
+
+- name: XWiki ensure quadlet directory exists
+  ansible.builtin.file:
+    path: "{{ XWIKI_QUADLET_DIR }}"
+    state: directory
+    owner: "{{ XWIKI_USER }}"
+    group: "{{ XWIKI_USER }}"
+    mode: "0750"
+
+- name: XWiki write quadlet container unit
+  ansible.builtin.copy:
+    dest: "{{ XWIKI_QUADLET_DIR }}/{{ XWIKI_CONTAINER_NAME }}.container"
+    owner: "{{ XWIKI_USER }}"
+    group: "{{ XWIKI_USER }}"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=XWiki (rootless Podman)
+      Wants=network-online.target
+      After=network-online.target
+
+      [Container]
+      ContainerName={{ XWIKI_CONTAINER_NAME }}
+      Image={{ XWIKI_IMAGE }}
+
+      # XWiki stores persistent data under /usr/local/xwiki in the container. :contentReference[oaicite:3]{index=3}
+      Volume={{ XWIKI_DATA_DIR }}:/usr/local/xwiki:Z
+
+      EnvironmentFile={{ XWIKI_ENV_FILE }}
+
+      # Bind only to localhost; nginx will reverse proxy.
+      PublishPort=127.0.0.1:{{ XWIKI_HTTP_PORT }}:8080
+
+      # Reasonable defaults
+      AutoUpdate=registry
+
+      [Install]
+      WantedBy=default.target
+
+- name: "XWiki | systemd --user daemon-reload"
+  become: true
+  become_user: "{{ XWIKI_USER }}"
+  ansible.builtin.command: "systemctl --user daemon-reload"
+  environment:
+    XDG_RUNTIME_DIR: "{{ XWIKI_XDG_RUNTIME_DIR }}"
+    DBUS_SESSION_BUS_ADDRESS: "{{ XWIKI_DBUS_SESSION_BUS_ADDRESS }}"
+  changed_when: false
+
+
+- name: "XWiki | Start container service (generated; do not enable)"
+  block:
+    - name: "XWiki | Start service"
+      ansible.builtin.command:
+        cmd: >-
+          systemctl --machine={{ XWIKI_USER }}@.host --user
+          start {{ XWIKI_SERVICE_NAME }}.service
+      changed_when: false
+
+  # rescue:
+  #   - name: "XWiki | Status (for debugging)"
+  #     ansible.builtin.command:
+  #       cmd: >-
+  #         systemctl --user -M {{ XWIKI_USER }}@.host
+  #         status {{ XWIKI_SERVICE_NAME }}.service --no-pager
+  #     changed_when: false
+  #     failed_when: false
+  #     register: xwiki_status
+
+  #   - name: "XWiki | Journal (for debugging)"
+  #     ansible.builtin.command:
+  #       cmd: >-
+  #         journalctl --user -M {{ XWIKI_USER }}@.host
+  #         -xeu {{ XWIKI_SERVICE_NAME }}.service --no-pager
+  #     changed_when: false
+  #     failed_when: false
+  #     register: xwiki_journal
+
+  #   - name: "XWiki | Show status"
+  #     ansible.builtin.debug:
+  #       var: xwiki_status.stdout_lines
+
+  #   - name: "XWiki | Show journal"
+  #     ansible.builtin.debug:
+  #       var: xwiki_journal.stdout_lines
+
+  #   - name: "XWiki | Fail after diagnostics"
+  #     ansible.builtin.fail:
+  #       msg: "XWiki service failed to start; see debug output above."
+# If SELinux is enforcing, nginx needs permission to connect to the chosen upstream port.
+# This tags the port as http_port_t. (Safe even if you later proxy other apps on the same port.)
+- name: XWiki allow nginx to proxy to local port on SELinux systems
+  ansible.builtin.command: semanage port -a -t http_port_t -p tcp {{ XWIKI_HTTP_PORT }}
+  register: xwiki_semanage_add
+  changed_when: xwiki_semanage_add.rc == 0
+  failed_when: xwiki_semanage_add.rc != 0 and ("already defined" not in (xwiki_semanage_add.stderr | default('')))
+  when: ansible_facts.selinux is defined and ansible_facts.selinux.status == "enabled"
+
+- name: XWiki write nginx vhost
+  ansible.builtin.copy:
+    dest: "{{ XWIKI_NGINX_CONF }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Redirect http to https
+      server {
+          listen {{ WG_SERVER_IP }}:80;
+          server_name {{ XWIKI_HOST }};
+          return 301 https://$host$request_uri;
+      }
+      server {
+          listen {{  WG_SERVER_IP }}:443 ssl;
+          http2 on;
+          server_name {{ XWIKI_HOST }};
+
+          # Match your existing nginx layout (your template tasks likely drop shared TLS params here)
+          include /etc/nginx/default.d/*.conf;
+          ssl_certificate     /etc/pki/nginx/{{ DOMAIN }}/wildcard.crt;
+          ssl_certificate_key /etc/pki/nginx/{{ DOMAIN }}/wildcard.key;
+          access_log /var/log/nginx/{{ XWIKI_HOST }}_access.log main;
+          error_log  /var/log/nginx/{{ XWIKI_HOST }}_error.log warn;
+          client_max_body_size 100m;
+
+          location / {
+              proxy_pass http://127.0.0.1:{{ XWIKI_HTTP_PORT }};
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              proxy_read_timeout 300;
+              proxy_send_timeout 300;
+          }
+      }
+
+- name: XWiki reload nginx
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

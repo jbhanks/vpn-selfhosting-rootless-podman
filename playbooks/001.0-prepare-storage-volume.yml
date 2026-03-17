@@ -1,0 +1,115 @@
+---
+#########################
+######### Set up block device ##########
+###########################
+- name: Create /mnt/datavol mount point
+  become: true
+  ansible.builtin.file:
+    path: /mnt/datavol
+    state: directory
+    owner: root
+    group: root
+    mode: "0711"
+
+- name: Ensure /mnt/datavol is not mounted
+  mount:
+    path: /mnt/datavol
+    state: unmounted
+
+- name: Remove any old /mnt/datavol fstab entry
+  mount:
+    path: /mnt/datavol
+    state: absent
+
+
+############################################
+######### Identify Hetzner volume ##########
+############################################
+
+- name: Get block devices as JSON
+  ansible.builtin.command: lsblk --json -dn -o NAME,MODEL,TYPE
+  register: block_devices
+  changed_when: false
+
+- name: Parse block device JSON
+  ansible.builtin.set_fact:
+    _block_devices: "{{ (block_devices.stdout | from_json).blockdevices }}"
+
+- name: Collect Hetzner volume candidates
+  ansible.builtin.set_fact:
+    _volume_candidates: >-
+      {{
+        _block_devices
+        | selectattr('type', 'equalto', 'disk')
+        | selectattr('model', 'equalto', 'Volume')
+        | map(attribute='name')
+        | map('regex_replace', '^', '/dev/')
+        | list
+      }}
+
+- name: Fail unless exactly one Hetzner volume is present
+  ansible.builtin.assert:
+    that:
+      - _volume_candidates | length == 1
+    fail_msg: >-
+      Expected exactly one disk with MODEL=Volume, found
+      {{ _volume_candidates | length }}.
+      Candidates={{ _volume_candidates }}
+      lsblk={{ _block_devices }}
+
+- name: Set external device fact
+  ansible.builtin.set_fact:
+    external_device: "{{ _volume_candidates[0] }}"
+
+
+############################################
+######### Prepare filesystem ################
+############################################
+
+- name: Find if external device is mounted
+  command: findmnt -nr -o TARGET --source={{ external_device }}
+  register: external_mount
+  failed_when: false
+  changed_when: false
+  when: external_device is defined
+
+- name: Unmount external device if mounted
+  ansible.posix.mount:
+    path: "{{ external_mount.stdout }}"
+    state: unmounted
+  when:
+    - external_device is defined
+    - external_mount.stdout is defined
+    - external_mount.stdout.startswith('/mnt')
+
+- name: Format external device as XFS (force)
+  community.general.filesystem:
+    fstype: xfs
+    dev: "{{ external_device }}"
+    force: yes
+  when: external_device is defined
+
+
+############################################
+######### Mount volume #####################
+############################################
+
+# Get the UUID after formatting; retry briefly in case udev is slow
+- name: Get UUID of volume
+  ansible.builtin.command: blkid -s UUID -o value "{{ external_device }}"
+  register: volume_uuid
+  changed_when: false
+  retries: 5
+  delay: 1
+  until: volume_uuid.stdout is match('^[A-Fa-f0-9-]+$')
+
+# Canonical, single source of truth: mount via UUID and write fstab
+- name: Mount "/mnt/datavol" by UUID and persist to fstab
+  ansible.builtin.mount:
+    path: /mnt/datavol
+    src: "UUID={{ volume_uuid.stdout }}"
+    fstype: xfs
+    opts: defaults,noatime
+    dump: 1
+    passno: 2
+    state: mounted
